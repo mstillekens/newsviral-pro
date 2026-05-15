@@ -239,13 +239,15 @@ async def tarea_4_replicate_pro(
 async def tarea_5_componer_video_pro(
     elementos: Dict[str, Any],
     config: ConfigPro,
+    news_title: str = "",
+    news_source: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """TAREA 5: Compose final video with FFmpeg"""
+    """TAREA 5: Compose final video with FFmpeg, with newsroom branding."""
     logger.info("🎬 TAREA 5: Composición Video Final", tiempo=True)
 
     try:
         branding = BrandingConfig(colors=config.colores_morena)
-        compositor = VideoCompositor(branding)
+        compositor = VideoCompositor(branding, news_title=news_title, news_source=news_source)
         composed_video = compositor.compose_with_audio(elementos)
         resultado = compositor.export_mp4(composed_video)
         logger.success(f"Video final: {resultado['video_path']}")
@@ -264,6 +266,7 @@ async def produce_video_for_script(
     config: ConfigPro,
     run_log: RunLogger,
     mock: bool,
+    news_source: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Run TAREA 4 + 5 for one news item's script, copy the resulting mp4 into
     the per-run log dir, and return the result metadata."""
@@ -271,11 +274,20 @@ async def produce_video_for_script(
 
     prompts = script.to_prompts_dict()
 
+    # Inject voice_params from env so the orchestrator passes the trained
+    # chilango voice (if any) to MiniMax. The orchestrator iterates only over
+    # escena_* keys so this top-level entry is safe to add.
+    minimax_voice_id = os.environ.get("MINIMAX_VOICE_ID", "")
+    if minimax_voice_id:
+        prompts = {**prompts, "voice_params": {"voice_id": minimax_voice_id, "language_boost": "Spanish"}}
+
     elementos = await tarea_4_replicate_pro(prompts, config, skip_replicate=mock)
     if elementos is None:
         return None
 
-    resultado = await tarea_5_componer_video_pro(elementos, config)
+    resultado = await tarea_5_componer_video_pro(
+        elementos, config, news_title=news_title, news_source=news_source
+    )
     if resultado is None:
         return None
 
@@ -336,7 +348,9 @@ async def run(config: ConfigPro, mock: bool) -> int:
     tracker.start("videos")
     produced: List[Dict[str, Any]] = []
     for idx, (item, script) in enumerate(zip(accepted_items[: len(scripts)], scripts), start=1):
-        result = await produce_video_for_script(idx, script, item.title, config, run_log, mock)
+        result = await produce_video_for_script(
+            idx, script, item.title, config, run_log, mock, news_source=item.source
+        )
         if result:
             produced.append(result)
     tracker.done("videos", message=f"{len(produced)} videos")

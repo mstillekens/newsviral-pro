@@ -3,9 +3,35 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 import logging
+import shutil
 from datetime import datetime
 import json
 import re
+
+
+def _pick_ffmpeg_with_drawtext() -> str:
+    """The default `brew install ffmpeg` ships *without* libfreetype, so the
+    `drawtext` filter isn't compiled in — branding overlays would silently
+    fail. `brew install ffmpeg-full` provides a keg-only build at
+    /opt/homebrew/opt/ffmpeg-full/bin that does include drawtext. Prefer it
+    when present; otherwise fall back to the PATH ffmpeg and let the brand
+    pass handle the absence gracefully."""
+    candidate = "/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"
+    if Path(candidate).exists():
+        return candidate
+    found = shutil.which("ffmpeg")
+    return found or "ffmpeg"
+
+
+FFMPEG_BIN = _pick_ffmpeg_with_drawtext()
+
+from brand_style import (
+    BrandStyle,
+    build_bug_filter,
+    build_intro_card_cmd,
+    build_lower_third_filter,
+    build_outro_card_cmd,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,35 +41,51 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BrandingConfig:
-    """Branding configuration with Morena colors"""
+    """Lightweight legacy wrapper kept for backwards compat with code that
+    expects `colors=...`. The real brand definition is now `BrandStyle` in
+    brand_style.py — this class just forwards into it for instantiation."""
     colors: Dict[str, str]
     watermark_text: str = "VOZ DEL PUEBLO"
     watermark_position: str = "bottom-right"
     watermark_opacity: float = 0.7
 
+    def to_brand_style(self) -> BrandStyle:
+        return BrandStyle(
+            newsroom_name=self.watermark_text,
+            primary_hex=self.colors.get("primary", "235B4E").lstrip("#"),
+            accent_hex=self.colors.get("accent", "9F2241").lstrip("#"),
+            bg_hex=self.colors.get("bg", "000000").lstrip("#"),
+        )
+
 
 class VideoCompositor:
     """Compose video from images and audio using FFmpeg"""
 
-    def __init__(self, config: BrandingConfig = None):
+    def __init__(self, config: BrandingConfig = None, news_title: str = "", news_source: str = ""):
         self.config = config or BrandingConfig(
             colors={
-                "primary": "#235B4E",    # Verde Morena
-                "accent": "#9F2241",     # Rojo Morena
-                "bg": "#000000"
+                "primary": "#235B4E",
+                "accent": "#9F2241",
+                "bg": "#000000",
             }
         )
+        self.style: BrandStyle = self.config.to_brand_style()
+        self.news_title = news_title or "Noticias QR"
+        self.news_source = news_source or self.style.tagline
         self.work_dir = Path("video_work")
         self.output_dir = Path("video_output")
         self.work_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
         self._check_ffmpeg()
-        logger.info("VideoCompositor initialized")
+        if self.style.font_path:
+            logger.info(f"VideoCompositor initialized (brand font: {self.style.font_path})")
+        else:
+            logger.warning("VideoCompositor: no usable font found; branding overlays disabled")
 
     def _check_ffmpeg(self):
         """Verify FFmpeg and FFprobe are installed"""
         try:
-            subprocess.run(["ffmpeg", "-version"],
+            subprocess.run([FFMPEG_BIN, "-version"],
                          capture_output=True, check=True, timeout=5)
             subprocess.run(["ffprobe", "-version"],
                          capture_output=True, check=True, timeout=5)
@@ -131,7 +173,7 @@ class VideoCompositor:
                 audio_filter = "[1:a]aresample=48000[aout]"
                 audio_map = ["-map", "[aout]"]
 
-            cmd = ["ffmpeg", "-y"] + input_args + [
+            cmd = [FFMPEG_BIN, "-y"] + input_args + [
                 "-filter_complex",
                 "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
                 "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[vout];"
@@ -157,7 +199,7 @@ class VideoCompositor:
 
         output_video = self.work_dir / "composed_raw.mp4"
         cmd = [
-            "ffmpeg", "-y",
+            FFMPEG_BIN, "-y",
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
             "-c", "copy",
@@ -218,7 +260,7 @@ class VideoCompositor:
         filter_complex = ";".join(filter_parts)
 
         output_video = self.work_dir / "composed_raw.mp4"
-        cmd = ["ffmpeg", "-y"] + input_args + [
+        cmd = [FFMPEG_BIN, "-y"] + input_args + [
             "-filter_complex", filter_complex,
             "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264", "-preset", "fast", "-crf", "18",
@@ -255,52 +297,87 @@ class VideoCompositor:
             return 12.0
 
     def apply_branding(self, input_video: str, output_video: str) -> str:
-        """Apply Morena branding: watermark + color overlay"""
-        logger.info(f"🎨 Applying branding to video...")
+        """Wrap the composed video with the newsroom brand pass:
+        - desaturated/contrast grade
+        - top-right 'VOZ DEL PUEBLO' bug
+        - lower third with news title + source
+        - 2s intro card and 2s outro card concatenated at the ends
 
-        # Create watermark overlay
-        watermark_filter = self._create_watermark_filter()
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_video,
-            "-vf", watermark_filter,
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-c:a", "aac",
-            output_video
-        ]
-
-        try:
-            subprocess.run(cmd, capture_output=True, check=True, timeout=3600)
-            logger.info(f"✅ Branding applied: {output_video}")
-            return output_video
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"Branding application failed, continuing: {e}")
-            # Copy without branding if filter fails
+        If the system has no usable font (style.font_path is None), this falls
+        back to a simple copy so the pipeline never breaks on a font-less host.
+        """
+        if not self.style.font_path:
+            logger.warning("Branding skipped (no font available); copying through")
             subprocess.run(["cp", input_video, output_video], check=True)
             return output_video
 
-    def _create_watermark_filter(self) -> str:
-        """Create FFmpeg filter string for watermark"""
-        primary_color = self.config.colors.get("primary", "#235B4E")
+        graded_path = self.work_dir / "branded_graded.mp4"
+        intro_path = self.work_dir / "card_intro.mp4"
+        outro_path = self.work_dir / "card_outro.mp4"
+        wrapped_path = Path(output_video)
 
-        # Remove # from hex
-        color_hex = primary_color.lstrip("#")
+        # 1. Grade + overlays in one pass.
+        grade = self.style.grade_filter
+        lower_third = build_lower_third_filter(self.style, self.news_title, self.news_source)
+        bug = build_bug_filter(self.style)
+        chain = ",".join(part for part in [grade, lower_third, bug] if part)
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-i", input_video,
+            "-vf", chain,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+            str(graded_path),
+        ]
+        logger.info("🎨 Brand pass: grade + lower-third + bug")
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=1800)
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Brand pass failed, copying through: {e.stderr.decode()[-500:]}")
+            subprocess.run(["cp", input_video, output_video], check=True)
+            return output_video
 
-        # Create drawtext filter
-        filter_str = (
-            f"drawtext="
-            f"text='{self.config.watermark_text}':"
-            f"fontsize=30:"
-            f"fontcolor=white:"
-            f"x=w-200:"
-            f"y=h-50:"
-            f"shadowx=2:"
-            f"shadowy=2"
+        # 2. Render intro + outro cards.
+        intro_cmd = build_intro_card_cmd(self.style, intro_path, self.news_title, self.news_source)
+        outro_cmd = build_outro_card_cmd(self.style, outro_path)
+        if not intro_cmd or not outro_cmd:
+            # If we suddenly can't build cards, just return the graded body.
+            logger.warning("Intro/outro skipped; returning graded body only")
+            subprocess.run(["cp", str(graded_path), output_video], check=True)
+            return output_video
+
+        try:
+            logger.info("🎬 Rendering intro card")
+            subprocess.run(intro_cmd, capture_output=True, check=True, timeout=300)
+            logger.info("🎬 Rendering outro card")
+            subprocess.run(outro_cmd, capture_output=True, check=True, timeout=300)
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Card render failed, skipping wrap: {e.stderr.decode()[-500:]}")
+            subprocess.run(["cp", str(graded_path), output_video], check=True)
+            return output_video
+
+        # 3. Concat intro + body + outro via the demuxer (stream copy).
+        concat_list = self.work_dir / "wrap_concat.txt"
+        concat_list.write_text(
+            f"file '{intro_path.resolve()}'\n"
+            f"file '{graded_path.resolve()}'\n"
+            f"file '{outro_path.resolve()}'\n"
         )
-
-        return filter_str
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(wrapped_path),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=600)
+            logger.info(f"✅ Branded with intro/outro: {wrapped_path}")
+            return str(wrapped_path)
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Intro/outro concat failed: {e.stderr.decode()[-500:]}")
+            subprocess.run(["cp", str(graded_path), output_video], check=True)
+            return output_video
 
     def normalize_audio(self, audio_path: str, output_path: Optional[str] = None) -> str:
         """Normalize audio levels"""
@@ -310,7 +387,7 @@ class VideoCompositor:
         logger.info(f"🔊 Normalizing audio: {audio_path}")
 
         cmd = [
-            "ffmpeg", "-y",
+            FFMPEG_BIN, "-y",
             "-i", audio_path,
             "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
             output_path
@@ -337,7 +414,7 @@ class VideoCompositor:
         width, height = resolution.split("x")
 
         cmd = [
-            "ffmpeg", "-y",
+            FFMPEG_BIN, "-y",
             "-i", video_path,
             "-c:v", "libx264",
             "-preset", "fast",

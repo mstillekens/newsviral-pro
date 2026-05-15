@@ -241,10 +241,19 @@ class ReplicateOrchestrator:
     # ----- AUDIO (MiniMax) -----
 
     async def generate_audio_batch(
-        self, scripts: List[str], voice_params: Dict
+        self,
+        scripts: List[str],
+        voice_params: Dict,
+        emotions: Optional[List[str]] = None,
     ) -> Dict[str, str]:
+        """Generate audios in parallel. `emotions[i]` is the MiniMax emotion
+        for scene i+1; falls back to "auto" per scene if not provided."""
         logger.info(f"🎤 Audio batch: {len(scripts)} scripts")
-        tasks = [self._generate_single_audio(s, i, voice_params) for i, s in enumerate(scripts)]
+        emotions = emotions or ["auto"] * len(scripts)
+        tasks = [
+            self._generate_single_audio(s, i, voice_params, emotions[i] if i < len(emotions) else "auto")
+            for i, s in enumerate(scripts)
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: Dict[str, str] = {}
         for i, r in enumerate(results):
@@ -255,11 +264,15 @@ class ReplicateOrchestrator:
         logger.info(f"✅ Audios: {len(out)}/{len(scripts)}")
         return out
 
-    async def _generate_single_audio(self, script: str, index: int, voice_params: Dict) -> str:
+    async def _generate_single_audio(
+        self, script: str, index: int, voice_params: Dict, emotion: str = "auto"
+    ) -> str:
         for attempt in range(self.config.max_retries):
             try:
                 await self.rate_limiter.acquire()
-                logger.info(f"🔊 [AUD-{index+1}] MiniMax (try {attempt+1}/{self.config.max_retries})")
+                logger.info(
+                    f"🔊 [AUD-{index+1}] MiniMax emotion={emotion} (try {attempt+1}/{self.config.max_retries})"
+                )
 
                 if self.config.skip_replicate:
                     mock = self.output_dir / f"audio_{index+1}_mock.mp3"
@@ -269,6 +282,7 @@ class ReplicateOrchestrator:
                 audio_input = {
                     "text": script[:3000],
                     "language_boost": voice_params.get("language_boost", "Spanish"),
+                    "emotion": emotion,
                 }
                 vid = voice_params.get("voice_id")
                 if vid:
@@ -337,16 +351,25 @@ class ReplicateOrchestrator:
         logger.info("🎬 REPLICATE ORCHESTRATION START")
         logger.info("=" * 70)
 
-        image_prompts = [p.get("imagen_prompt", "") for p in prompts.values()]
-        motion_prompts = [p.get("motion_prompt", "") for p in prompts.values()]
-        audio_scripts = [p.get("audio_script", "") for p in prompts.values()]
-        voice_params = prompts.get("voice_params", {})
+        # Iterate only over per-scene entries (keys starting "escena_") so that
+        # auxiliary keys like voice_params don't leak into the prompt lists.
+        scene_entries = [
+            (k, v) for k, v in prompts.items()
+            if k.startswith("escena_") and isinstance(v, dict)
+        ]
+        image_prompts = [v.get("imagen_prompt", "") for _, v in scene_entries]
+        motion_prompts = [v.get("motion_prompt", "") for _, v in scene_entries]
+        audio_scripts = [v.get("audio_script", "") for _, v in scene_entries]
+        emotions = [v.get("emotion", "auto") for _, v in scene_entries]
+        voice_params = prompts.get("voice_params", {}) if isinstance(prompts.get("voice_params"), dict) else {}
 
         if not image_prompts or not audio_scripts:
             raise ValueError("Invalid prompts format: missing imagen_prompt/audio_script")
 
         start = datetime.now()
-        audios_task = asyncio.create_task(self.generate_audio_batch(audio_scripts, voice_params))
+        audios_task = asyncio.create_task(
+            self.generate_audio_batch(audio_scripts, voice_params, emotions)
+        )
 
         if self.config.enable_video:
             # FLUX URLs → Seedance → local mp4
