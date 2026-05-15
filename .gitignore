@@ -1,0 +1,77 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.token
+.secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.sublime-project
+.sublime-workspace
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.cover
+
+# Video/Media Files (too large)
+*.mp4
+*.mp3
+*.wav
+*.mov
+*.mkv
+*.avi
+*.jpg
+*.jpeg
+*.png
+temp/
+replicate_outputs/
+video_work/
+video_output/
+
+# Logs
+*.log
+logs/
+
+# Node modules (if needed)
+node_modules/
