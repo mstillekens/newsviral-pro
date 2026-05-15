@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from web_dashboard import ProgressTracker
+from replicate_orchestrator import ReplicateOrchestrator, ReplicateConfig
+from video_compositor import VideoCompositor, BrandingConfig
 
 
 # ---------- Logger ----------
@@ -89,20 +91,54 @@ async def tarea_4_replicate_pro(
     config: ConfigPro,
     skip_replicate: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """STUB — replaced in Task 6 by the Phase 2 ReplicateOrchestrator call."""
-    logger.info("🎥 TAREA 4: Replicate Orchestration (stub)", tiempo=True)
-    await asyncio.sleep(0.01)
-    return None
+    """TAREA 4: Orchestrate Replicate (parallel execution)"""
+    logger.info("🎥 TAREA 4: Replicate Orchestration (PARALELO)", tiempo=True)
+
+    try:
+        replicate_config = ReplicateConfig(
+            api_token=config.replicate_api_token or os.getenv("REPLICATE_API_TOKEN", ""),
+            skip_replicate=skip_replicate,
+        )
+
+        orchestrator = ReplicateOrchestrator(replicate_config)
+
+        elementos = await orchestrator.orchestrate_parallel(prompts, config)
+
+        is_valid = await orchestrator.validate_outputs(elementos)
+
+        if is_valid:
+            logger.success("✅ Replicate orchestration complete")
+            return elementos
+        else:
+            logger.error("Validation failed")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error Tarea 4: {str(e)}")
+        return None
 
 
 async def tarea_5_componer_video_pro(
     elementos: Dict[str, Any],
     config: ConfigPro,
 ) -> Optional[Dict[str, Any]]:
-    """STUB — replaced in Task 6 by the Phase 2 VideoCompositor call."""
-    logger.info("🎬 TAREA 5: Composición Video Final (stub)", tiempo=True)
-    await asyncio.sleep(0.01)
-    return None
+    """TAREA 5: Compose final video with FFmpeg"""
+    logger.info("🎬 TAREA 5: Composición Video Final", tiempo=True)
+
+    try:
+        branding = BrandingConfig(colors=config.colores_morena)
+        compositor = VideoCompositor(branding)
+
+        composed_video = compositor.compose_with_audio(elementos)
+
+        resultado = compositor.export_mp4(composed_video)
+
+        logger.success(f"✅ Video final: {resultado['video_path']}")
+        return resultado
+
+    except Exception as e:
+        logger.error(f"Error Tarea 5: {str(e)}")
+        return None
 
 
 # ---------- Entrypoint ----------
