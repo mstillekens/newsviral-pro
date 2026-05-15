@@ -55,7 +55,11 @@ class VideoCompositor:
                           background_music: Optional[str] = None,
                           scene_duration: float = 12.0) -> str:
         """
-        Compose video from images and audios.
+        Compose video from images and audios using filter_complex.
+
+        Each scene: still image looped for the duration of its scene audio,
+        then all scenes concatenated to a single timeline. Scene duration =
+        the scene's audio length, or scene_duration if audio is missing.
 
         Input: {
             "imagenes": {"escena_1": "path1.jpg", ...},
@@ -73,32 +77,67 @@ class VideoCompositor:
         if not images or not audios:
             raise ValueError("Missing images or audios")
 
-        # Create concat file
-        concat_file = self._create_concat_file(images, audios, scene_duration)
+        # Pair scenes in deterministic key order and resolve durations.
+        scenes = []
+        for key in sorted(images.keys()):
+            img_path = Path(images[key]).resolve()
+            audio_path_str = audios.get(key, "")
+            audio_path = Path(audio_path_str).resolve() if audio_path_str else None
+            if audio_path and audio_path.exists():
+                dur = self._get_audio_duration(str(audio_path))
+            else:
+                dur = scene_duration
+            scenes.append((img_path, audio_path, dur))
+
+        logger.info(f"🎨 Composing {len(scenes)} scenes via filter_complex...")
+
+        # Build ffmpeg input args: per scene, a looped image and its audio.
+        # Scenes without audio get a silent track of the right duration.
+        input_args: List[str] = []
+        for img_path, audio_path, dur in scenes:
+            input_args += ["-loop", "1", "-t", f"{dur:.3f}", "-i", str(img_path)]
+            if audio_path and audio_path.exists():
+                input_args += ["-i", str(audio_path)]
+            else:
+                input_args += [
+                    "-f", "lavfi", "-t", f"{dur:.3f}",
+                    "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                ]
+
+        # Build filter_complex: scale+pad each video to 1920x1080, then concat.
+        filter_parts: List[str] = []
+        concat_inputs: List[str] = []
+        for idx in range(len(scenes)):
+            v_in = idx * 2          # video input index
+            a_in = idx * 2 + 1      # audio input index
+            filter_parts.append(
+                f"[{v_in}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+                f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{idx}]"
+            )
+            concat_inputs.append(f"[v{idx}][{a_in}:a]")
+        filter_parts.append(
+            "".join(concat_inputs) + f"concat=n={len(scenes)}:v=1:a=1[v][a]"
+        )
+        filter_complex = ";".join(filter_parts)
 
         output_video = self.work_dir / "composed_raw.mp4"
-
-        # Compose video
-        logger.info("🎨 Composing video from segments...")
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(concat_file),
+        cmd = ["ffmpeg", "-y"] + input_args + [
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264",
             "-preset", "fast",
             "-crf", "18",
             "-c:a", "aac",
             "-b:a", "192k",
             "-ar", "48000",
-            str(output_video)
+            str(output_video),
         ]
 
         try:
             subprocess.run(cmd, capture_output=True, check=True, timeout=7200)
             logger.info(f"✅ Video composed: {output_video}")
         except subprocess.CalledProcessError as e:
-            logger.error(f"❌ Composition failed: {e.stderr.decode()}")
+            logger.error(f"❌ Composition failed: {e.stderr.decode()[-1000:]}")
             raise
 
         # Apply branding
@@ -108,35 +147,13 @@ class VideoCompositor:
 
         return str(branded_video)
 
-    def _create_concat_file(self, images: Dict[str, str], audios: Dict[str, str],
-                           duration: float = 12.0) -> Path:
-        """Create FFmpeg concat demux file"""
-        concat_file = self.work_dir / "concat.txt"
-
-        logger.info(f"📝 Creating concat file with {len(images)} scenes...")
-
-        with open(concat_file, 'w') as f:
-            for key in sorted(images.keys()):
-                img_path = Path(images[key]).resolve()
-                audio_path = Path(audios.get(key, "")).resolve()
-
-                f.write(f"file '{img_path}'\n")
-                f.write(f"duration {duration}\n")
-
-                if audio_path.exists():
-                    f.write(f"file '{audio_path}'\n")
-                    f.write(f"duration {self._get_audio_duration(str(audio_path))}\n")
-
-        logger.info(f"✅ Concat file created: {concat_file}")
-        return concat_file
-
     def _get_audio_duration(self, audio_path: str) -> float:
         """Get duration of audio file in seconds"""
         try:
             cmd = [
                 "ffprobe", "-v", "error",
                 "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1:noinv=1",
+                "-of", "default=noprint_wrappers=1:nokey=1",
                 audio_path
             ]
 
@@ -283,7 +300,7 @@ class VideoCompositor:
             cmd = [
                 "ffprobe", "-v", "error",
                 "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1:noinv=1",
+                "-of", "default=noprint_wrappers=1:nokey=1",
                 video_path
             ]
 
