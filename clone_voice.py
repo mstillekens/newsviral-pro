@@ -93,18 +93,34 @@ def _find_ffmpeg_dir() -> str:
     return str(Path(found).parent) if found else ""
 
 
-def _fetch_url_to_audio(url: str, out_dir: Path) -> Path:
+def _fetch_url_to_audio(
+    url: str,
+    out_dir: Path,
+    *,
+    start: int = 5,
+    duration: int = 180,
+) -> Path:
     """Resolve a URL into a local audio file.
 
     - Direct audio URLs → download as-is.
-    - Other URLs (YouTube, podcast pages, etc.) → require yt-dlp; extract a
-      30s mp3 starting at second 5 (skips intros).
+    - Other URLs (YouTube, podcast pages, etc.) → require yt-dlp; extract
+      `duration` seconds of mp3 starting at second `start`.
+
+    `start` defaults to 5 (skip a typical short intro). `duration` defaults
+    to 180 (3 minutes). MiniMax accepts 10s minimum, 300s maximum. More
+    material → better clone fidelity. The trade-off is risk of the extracted
+    window crossing into ads, multiple speakers, or background music.
 
     Cleans up any leftover downloaded_sample.* files from prior failed
     attempts so the next run starts fresh, and explicitly tells yt-dlp where
     to find ffmpeg/ffprobe via --ffmpeg-location (the keg-only ffmpeg-full
     isn't in PATH).
     """
+    if not 10 <= duration <= 300:
+        raise SystemExit(f"ERROR: --duration debe estar entre 10 y 300 segundos (recibí {duration})")
+    if start < 0:
+        raise SystemExit(f"ERROR: --start no puede ser negativo (recibí {start})")
+
     # Clean leftovers so a partial prior run can't get reused as if it were
     # the new download.
     for old in out_dir.glob("downloaded_sample.*"):
@@ -133,12 +149,14 @@ def _fetch_url_to_audio(url: str, out_dir: Path) -> Path:
         )
 
     dest = out_dir / "downloaded_sample.mp3"
-    print(f"⬇️  yt-dlp extrae 30s desde {url}")
+    end = start + duration
+    print(f"⬇️  yt-dlp extrae {duration}s desde {url}")
+    print(f"   segmento: del segundo {start} al {end} (≈{duration//60}m{duration%60:02d}s de audio)")
     print(f"   ffmpeg en: {ff_dir}")
     cmd = [
         "yt-dlp",
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--postprocessor-args", "ffmpeg:-ss 5 -t 30",
+        "--postprocessor-args", f"ffmpeg:-ss {start} -t {duration}",
         "--ffmpeg-location", ff_dir,
         "-o", str(dest),
         url,
@@ -246,6 +264,11 @@ def main() -> int:
     parser.add_argument("source", help="Local path or URL to audio sample")
     parser.add_argument("--preview", action="store_true",
                         help="Generate a test phrase and DON'T overwrite MINIMAX_VOICE_ID in .env")
+    parser.add_argument("--duration", type=int, default=180,
+                        help="Segundos de audio a usar para el entrenamiento. "
+                             "Rango 10-300 (default: 180 = 3 min). Más material = clon más fiel.")
+    parser.add_argument("--start", type=int, default=5,
+                        help="Segundo del video donde empezar (skip intro, default 5)")
     args = parser.parse_args()
 
     token = os.environ.get("REPLICATE_API_TOKEN", "")
@@ -257,7 +280,10 @@ def main() -> int:
     out_dir.mkdir(exist_ok=True)
 
     if _is_url(args.source):
-        sample = _fetch_url_to_audio(args.source, out_dir)
+        sample = _fetch_url_to_audio(
+            args.source, out_dir,
+            start=args.start, duration=args.duration,
+        )
     else:
         sample = Path(args.source).resolve()
         if not sample.exists():
