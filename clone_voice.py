@@ -75,13 +75,41 @@ def _is_direct_audio_url(url: str) -> bool:
     return lower.endswith((".mp3", ".wav", ".m4a", ".ogg", ".flac"))
 
 
+def _find_ffmpeg_dir() -> str:
+    """Return the directory containing ffmpeg + ffprobe binaries.
+
+    We prefer the keg-only ffmpeg-full at /opt/homebrew/opt/ffmpeg-full/bin
+    because that's the build the rest of the pipeline uses (it has
+    libfreetype/drawtext support that the regular `brew install ffmpeg` lacks).
+    If it's not present we fall back to whatever's in PATH.
+
+    yt-dlp needs the *directory* via --ffmpeg-location, not the binary path.
+    """
+    for candidate in ("/opt/homebrew/opt/ffmpeg-full/bin", "/usr/local/opt/ffmpeg-full/bin"):
+        p = Path(candidate)
+        if (p / "ffmpeg").exists() and (p / "ffprobe").exists():
+            return str(p)
+    found = shutil.which("ffmpeg")
+    return str(Path(found).parent) if found else ""
+
+
 def _fetch_url_to_audio(url: str, out_dir: Path) -> Path:
     """Resolve a URL into a local audio file.
 
     - Direct audio URLs → download as-is.
     - Other URLs (YouTube, podcast pages, etc.) → require yt-dlp; extract a
       30s mp3 starting at second 5 (skips intros).
+
+    Cleans up any leftover downloaded_sample.* files from prior failed
+    attempts so the next run starts fresh, and explicitly tells yt-dlp where
+    to find ffmpeg/ffprobe via --ffmpeg-location (the keg-only ffmpeg-full
+    isn't in PATH).
     """
+    # Clean leftovers so a partial prior run can't get reused as if it were
+    # the new download.
+    for old in out_dir.glob("downloaded_sample.*"):
+        old.unlink()
+
     if _is_direct_audio_url(url):
         ext = url.lower().split("?", 1)[0].rsplit(".", 1)[-1]
         dest = out_dir / f"downloaded_sample.{ext}"
@@ -96,21 +124,31 @@ def _fetch_url_to_audio(url: str, out_dir: Path) -> Path:
             "Instala con: brew install yt-dlp"
         )
 
+    ff_dir = _find_ffmpeg_dir()
+    if not ff_dir:
+        raise SystemExit(
+            "ERROR: yt-dlp requiere ffmpeg para extraer mp3 del video. No lo encuentro.\n"
+            "Instala con: brew install ffmpeg-full   (recomendado para todo el pipeline)\n"
+            "o bien:      brew install ffmpeg"
+        )
+
     dest = out_dir / "downloaded_sample.mp3"
     print(f"⬇️  yt-dlp extrae 30s desde {url}")
+    print(f"   ffmpeg en: {ff_dir}")
     cmd = [
         "yt-dlp",
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
         "--postprocessor-args", "ffmpeg:-ss 5 -t 30",
+        "--ffmpeg-location", ff_dir,
         "-o", str(dest),
         url,
     ]
     subprocess.run(cmd, check=True)
     if not dest.exists():
-        # yt-dlp sometimes adds extra suffix to filenames
-        for cand in out_dir.glob("downloaded_sample*"):
-            cand.rename(dest)
-            break
+        raise SystemExit(
+            f"ERROR: yt-dlp no produjo el mp3 esperado en {dest}. "
+            f"Revisa la salida de arriba."
+        )
     return dest
 
 
