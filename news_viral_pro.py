@@ -85,6 +85,7 @@ class ConfigPro:
     date_filter: Optional[str] = None       # "YYYY-MM-DD" UTC day filter
     auto_accept_top: int = 0                # >0: skip CLI, accept top-N automatically
     script_model: str = "claude-haiku-4-5"
+    enable_video: bool = True               # True = Seedance image→video; False = stills only
 
 
 # ---------- Tareas 1-3: news → script ----------
@@ -220,6 +221,7 @@ async def tarea_4_replicate_pro(
         replicate_config = ReplicateConfig(
             api_token=config.replicate_api_token or os.getenv("REPLICATE_API_TOKEN", ""),
             skip_replicate=skip_replicate,
+            enable_video=config.enable_video,
         )
         orchestrator = ReplicateOrchestrator(replicate_config)
         elementos = await orchestrator.orchestrate_parallel(prompts, config)
@@ -384,6 +386,8 @@ def main() -> None:
     p.add_argument("--max", type=int, default=12, help="Max items to score & show")
     p.add_argument("--auto", type=int, default=0, help="Skip CLI prompt, auto-accept the top N scored items")
     p.add_argument("--model", default="claude-haiku-4-5", help="Anthropic model for script writing")
+    p.add_argument("--no-video", action="store_true",
+                   help="Skip Seedance step (use still images only — ~9x cheaper, lower quality)")
     args = p.parse_args()
 
     config = ConfigPro(
@@ -394,6 +398,7 @@ def main() -> None:
         date_filter=args.date,
         auto_accept_top=args.auto,
         script_model=args.model,
+        enable_video=not args.no_video,
     )
 
     if not config.anthropic_api_key and not args.mock:

@@ -1,35 +1,59 @@
+"""Replicate orchestration: FLUX images → Seedance video clips → MiniMax audio.
+
+Two execution modes controlled by `ReplicateConfig.enable_video`:
+
+- enable_video=False  (cheap, ~$0.17/video):
+    FLUX images + MiniMax audios → compositor loops stills as the video track.
+    This is the original Phase 2 path. Kept as the cost-conscious fallback.
+
+- enable_video=True   (default, ~$1.50/video):
+    FLUX images → Seedance 1 Pro animates each image into a 5s clip with a
+    per-scene motion_prompt. MiniMax audios run in parallel. The compositor
+    receives real mp4 clips and just concatenates them with their audios.
+
+The pipeline is structured so audios run in parallel with the FLUX→Seedance
+chain — audio is independent and finishes long before Seedance does.
+"""
 import asyncio
-import replicate
-from typing import Dict, List, Optional
+import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
-import logging
 from pathlib import Path
-import aiohttp
-import time
-import json
+from typing import Dict, List, Optional
 
-# Configure logging
+import aiohttp
+import replicate
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ReplicateConfig:
-    """Configuration for Replicate orchestration"""
+    """Configuration for Replicate orchestration."""
     api_token: str
     max_concurrent: int = 10
     rate_limit_per_min: int = 50
     timeout_image_min: int = 15
     timeout_audio_min: int = 5
+    timeout_video_min: int = 10
     max_retries: int = 3
-    skip_replicate: bool = False  # For testing/demo
+    skip_replicate: bool = False
+
+    # Phase 4: image → video
+    enable_video: bool = True
+    video_model: str = "bytedance/seedance-1-pro"
+    video_duration: int = 8
+    video_resolution: str = "1080p"
+    video_aspect_ratio: str = "16:9"   # keep horizontal for now; 9:16 is a v2 flag
 
 
 class RateLimiter:
-    """Simple rate limiter for API calls"""
+    """Simple rate limiter for API calls."""
 
     def __init__(self, requests_per_minute: int):
         self.rate = requests_per_minute
@@ -37,7 +61,6 @@ class RateLimiter:
         self.last_request = 0
 
     async def acquire(self):
-        """Wait if needed to maintain rate limit"""
         elapsed = time.time() - self.last_request
         if elapsed < self.min_interval:
             await asyncio.sleep(self.min_interval - elapsed)
@@ -45,7 +68,7 @@ class RateLimiter:
 
 
 class ReplicateOrchestrator:
-    """Orchestrates parallel execution of FLUX (images) and ElevenLabs (audio) on Replicate"""
+    """Parallel FLUX + Seedance + MiniMax orchestrator."""
 
     def __init__(self, config: ReplicateConfig):
         self.config = config
@@ -54,120 +77,195 @@ class ReplicateOrchestrator:
         self.rate_limiter = RateLimiter(config.rate_limit_per_min)
         self.output_dir = Path("replicate_outputs")
         self.output_dir.mkdir(exist_ok=True)
-        logger.info(f"ReplicateOrchestrator initialized")
+        logger.info(
+            f"ReplicateOrchestrator initialized (enable_video={config.enable_video})"
+        )
 
-    async def generate_image_batch(self, prompts: List[str]) -> Dict[str, str]:
-        """Generate multiple images using FLUX Pro in parallel"""
-        logger.info(f"📷 Starting image generation: {len(prompts)} images")
+    # ----- IMAGES (FLUX) -----
 
-        tasks = [
-            self._generate_single_image(prompt, idx)
-            for idx, prompt in enumerate(prompts)
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        images = {}
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"❌ Image {idx+1}: {result}")
-            else:
-                images[f"escena_{idx+1}"] = result
-                logger.info(f"✅ Image {idx+1}: {result}")
-
-        logger.info(f"✅ Generated {len(images)}/{len(prompts)} images")
-        return images
-
-    async def _generate_single_image(self, prompt: str, index: int) -> str:
-        """Generate single image with retry logic"""
+    async def _generate_image_url(self, prompt: str, index: int) -> str:
+        """Call FLUX-pro and return the resulting image URL (no local download)."""
         for attempt in range(self.config.max_retries):
             try:
                 await self.rate_limiter.acquire()
-
-                logger.info(f"🎨 [IMG-{index+1}] Generating (attempt {attempt+1}/{self.config.max_retries})")
+                logger.info(f"🎨 [IMG-{index+1}] FLUX gen (try {attempt+1}/{self.config.max_retries})")
 
                 if self.config.skip_replicate:
-                    # Mock mode for testing
-                    image_path = self.output_dir / f"img_{index+1}_mock.jpg"
-                    image_path.touch()
-                    logger.info(f"📝 [IMG-{index+1}] Mock image created: {image_path}")
-                    return str(image_path)
+                    mock = self.output_dir / f"img_{index+1}_mock.jpg"
+                    mock.touch()
+                    return f"mock://{mock}"
 
-                # Real Replicate call
                 output = await asyncio.wait_for(
                     asyncio.to_thread(
                         self.client.run,
                         "black-forest-labs/flux-pro",
                         input={
-                            "prompt": prompt[:500],  # FLUX has prompt limit
+                            "prompt": prompt[:500],
                             "guidance": 3.5,
-                            "num_inference_steps": 50
-                        }
+                            "num_inference_steps": 50,
+                            "aspect_ratio": self.config.video_aspect_ratio,
+                        },
                     ),
-                    timeout=self.config.timeout_image_min * 60 + 30
+                    timeout=self.config.timeout_image_min * 60 + 30,
                 )
-
-                # Download image locally
-                image_path = await self._download_file(output, f"img_{index+1}.jpg")
-                logger.info(f"✅ [IMG-{index+1}] Downloaded: {image_path}")
-                return str(image_path)
+                url = str(output)
+                logger.info(f"✅ [IMG-{index+1}] URL: {url[:80]}")
+                return url
 
             except asyncio.TimeoutError:
-                logger.warning(f"⏱️ [IMG-{index+1}] Timeout (attempt {attempt+1})")
+                logger.warning(f"⏱  [IMG-{index+1}] Timeout (try {attempt+1})")
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
-
             except Exception as e:
-                logger.error(f"❌ [IMG-{index+1}] Error: {str(e)}")
+                logger.error(f"❌ [IMG-{index+1}] {e}")
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
 
-    async def generate_audio_batch(self, scripts: List[str], voice_params: Dict) -> Dict[str, str]:
-        """Generate multiple voiceovers using ElevenLabs in parallel"""
-        logger.info(f"🎤 Starting audio generation: {len(scripts)} audios")
+    async def _generate_and_download_image(self, prompt: str, index: int) -> str:
+        """FLUX → URL → local file. Returns local path string."""
+        url = await self._generate_image_url(prompt, index)
+        if url.startswith("mock://"):
+            return url[len("mock://"):]
+        local = await self._download_file(url, f"img_{index+1}.jpg")
+        return str(local)
 
-        tasks = [
-            self._generate_single_audio(script, idx, voice_params)
-            for idx, script in enumerate(scripts)
-        ]
-
+    async def generate_image_batch(self, prompts: List[str]) -> Dict[str, str]:
+        """Parallel FLUX gen + local download. {scene_N: local_path}."""
+        logger.info(f"📷 Image batch: {len(prompts)} prompts")
+        tasks = [self._generate_and_download_image(p, i) for i, p in enumerate(prompts)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        audios = {}
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"❌ Audio {idx+1}: {result}")
+        out: Dict[str, str] = {}
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"❌ Image {i+1}: {r}")
             else:
-                audios[f"escena_{idx+1}"] = result
-                logger.info(f"✅ Audio {idx+1}: {result}")
+                out[f"escena_{i+1}"] = r
+        logger.info(f"✅ Images: {len(out)}/{len(prompts)}")
+        return out
 
-        logger.info(f"✅ Generated {len(audios)}/{len(scripts)} audios")
-        return audios
+    async def generate_image_url_batch(self, prompts: List[str]) -> Dict[str, str]:
+        """Parallel FLUX gen returning URLs only. Used as input to Seedance."""
+        logger.info(f"📷 Image URL batch: {len(prompts)} prompts")
+        tasks = [self._generate_image_url(p, i) for i, p in enumerate(prompts)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: Dict[str, str] = {}
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"❌ ImageURL {i+1}: {r}")
+            else:
+                out[f"escena_{i+1}"] = r
+        logger.info(f"✅ Image URLs: {len(out)}/{len(prompts)}")
+        return out
 
-    async def _generate_single_audio(self, script: str, index: int, voice_params: Dict) -> str:
-        """Generate single audio with retry logic"""
+    # ----- VIDEO CLIPS (Seedance) -----
+
+    async def _animate_single(self, image_url: str, motion_prompt: str, index: int) -> str:
+        """Seedance image-to-video. Returns local mp4 path."""
         for attempt in range(self.config.max_retries):
             try:
                 await self.rate_limiter.acquire()
-
-                logger.info(f"🔊 [AUD-{index+1}] Generating (attempt {attempt+1}/{self.config.max_retries})")
+                logger.info(
+                    f"🎬 [VID-{index+1}] Seedance (try {attempt+1}/{self.config.max_retries}) "
+                    f"motion={motion_prompt[:60]!r}"
+                )
 
                 if self.config.skip_replicate:
-                    # Mock mode for testing
-                    audio_path = self.output_dir / f"audio_{index+1}_mock.mp3"
-                    audio_path.touch()
-                    logger.info(f"📝 [AUD-{index+1}] Mock audio created: {audio_path}")
-                    return str(audio_path)
+                    mock = self.output_dir / f"video_{index+1}_mock.mp4"
+                    mock.touch()
+                    return str(mock)
 
-                # Real Replicate call. voice_id is an opaque MiniMax enum
-                # (e.g. "English_Wiselady"). Only pass it if the caller provided
-                # one explicitly via voice_params["voice_id"], otherwise let
-                # MiniMax pick its default. language_boost makes an English
-                # voice speak Spanish text correctly.
+                if image_url.startswith("mock://"):
+                    mock = self.output_dir / f"video_{index+1}_mock.mp4"
+                    mock.touch()
+                    return str(mock)
+
+                output = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.run,
+                        self.config.video_model,
+                        input={
+                            "image": image_url,
+                            "prompt": motion_prompt[:500] or "subtle camera push-in, natural light",
+                            "duration": self.config.video_duration,
+                            "resolution": self.config.video_resolution,
+                            "aspect_ratio": self.config.video_aspect_ratio,
+                        },
+                    ),
+                    timeout=self.config.timeout_video_min * 60 + 60,
+                )
+                url = str(output)
+                logger.info(f"✅ [VID-{index+1}] mp4 URL ready")
+                local = await self._download_file(url, f"video_{index+1}.mp4")
+                return str(local)
+
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱  [VID-{index+1}] Timeout (try {attempt+1})")
+                if attempt < self.config.max_retries - 1:
+                    await asyncio.sleep(min(2 ** attempt, 60))
+                else:
+                    raise
+            except Exception as e:
+                logger.error(f"❌ [VID-{index+1}] {e}")
+                if attempt < self.config.max_retries - 1:
+                    await asyncio.sleep(min(2 ** attempt, 60))
+                else:
+                    raise
+
+    async def generate_video_batch(
+        self,
+        image_urls: Dict[str, str],
+        motion_prompts: List[str],
+    ) -> Dict[str, str]:
+        """Parallel Seedance animations. {scene_N: local_mp4_path}."""
+        logger.info(f"🎬 Video batch: {len(image_urls)} clips via {self.config.video_model}")
+        tasks = []
+        for i, mp in enumerate(motion_prompts):
+            url = image_urls.get(f"escena_{i+1}")
+            if not url:
+                continue
+            tasks.append(self._animate_single(url, mp, i))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: Dict[str, str] = {}
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"❌ Video {i+1}: {r}")
+            else:
+                out[f"escena_{i+1}"] = r
+        logger.info(f"✅ Videos: {len(out)}/{len(motion_prompts)}")
+        return out
+
+    # ----- AUDIO (MiniMax) -----
+
+    async def generate_audio_batch(
+        self, scripts: List[str], voice_params: Dict
+    ) -> Dict[str, str]:
+        logger.info(f"🎤 Audio batch: {len(scripts)} scripts")
+        tasks = [self._generate_single_audio(s, i, voice_params) for i, s in enumerate(scripts)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: Dict[str, str] = {}
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error(f"❌ Audio {i+1}: {r}")
+            else:
+                out[f"escena_{i+1}"] = r
+        logger.info(f"✅ Audios: {len(out)}/{len(scripts)}")
+        return out
+
+    async def _generate_single_audio(self, script: str, index: int, voice_params: Dict) -> str:
+        for attempt in range(self.config.max_retries):
+            try:
+                await self.rate_limiter.acquire()
+                logger.info(f"🔊 [AUD-{index+1}] MiniMax (try {attempt+1}/{self.config.max_retries})")
+
+                if self.config.skip_replicate:
+                    mock = self.output_dir / f"audio_{index+1}_mock.mp3"
+                    mock.touch()
+                    return str(mock)
+
                 audio_input = {
                     "text": script[:3000],
                     "language_boost": voice_params.get("language_boost", "Spanish"),
@@ -182,108 +280,131 @@ class ReplicateOrchestrator:
                         "minimax/speech-02-hd",
                         input=audio_input,
                     ),
-                    timeout=self.config.timeout_audio_min * 60 + 30
+                    timeout=self.config.timeout_audio_min * 60 + 30,
                 )
-
-                # Download audio locally
-                audio_path = await self._download_file(output, f"audio_{index+1}.mp3")
-                logger.info(f"✅ [AUD-{index+1}] Downloaded: {audio_path}")
-                return str(audio_path)
+                local = await self._download_file(output, f"audio_{index+1}.mp3")
+                logger.info(f"✅ [AUD-{index+1}] {local}")
+                return str(local)
 
             except Exception as e:
-                logger.error(f"❌ [AUD-{index+1}] Error: {str(e)}")
+                logger.error(f"❌ [AUD-{index+1}] {e}")
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
 
-    async def _download_file(self, url: str, filename: str) -> Path:
-        """Download file from Replicate URL"""
-        filepath = self.output_dir / filename
+    # ----- DOWNLOAD HELPER -----
 
+    async def _download_file(self, url, filename: str) -> Path:
+        filepath = self.output_dir / filename
         if self.config.skip_replicate:
             return filepath
 
-        logger.info(f"⬇️ Downloading: {filename}")
+        url_str = str(url)
+        logger.info(f"⬇️  Downloading {filename}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_str, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Download failed: HTTP {resp.status}")
+                with open(filepath, "wb") as f:
+                    f.write(await resp.read())
+        logger.info(f"✅ Saved {filepath}")
+        return filepath
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                    if resp.status == 200:
-                        with open(filepath, 'wb') as f:
-                            f.write(await resp.read())
-                        logger.info(f"✅ Saved: {filepath}")
-                        return filepath
-                    else:
-                        raise Exception(f"Download failed: HTTP {resp.status}")
-        except Exception as e:
-            logger.error(f"❌ Download error: {e}")
-            raise
+    # ----- ORCHESTRATION -----
 
     async def orchestrate_parallel(self, prompts: Dict[str, Dict], config=None) -> Dict:
-        """
-        Main orchestration function: generate images and audios in parallel.
+        """Run full Replicate pipeline.
 
-        Input: {
-            "escena_1": {"imagen_prompt": "...", "audio_script": "..."},
+        Input shape: {
+            "escena_1": {"imagen_prompt": "...", "motion_prompt": "...", "audio_script": "..."},
             "escena_2": {...},
             ...
         }
+
+        Output shape (enable_video=True):
+            {"imagenes": {...},     # local paths (optional)
+             "videos":   {...},     # local mp4 paths
+             "audios":   {...},     # local mp3 paths
+             "metadata": {...}}
+
+        Output shape (enable_video=False):
+            {"imagenes": {...},     # local paths
+             "audios":   {...},
+             "metadata": {...}}
         """
-        logger.info("="*70)
+        logger.info("=" * 70)
         logger.info("🎬 REPLICATE ORCHESTRATION START")
-        logger.info("="*70)
+        logger.info("=" * 70)
 
         image_prompts = [p.get("imagen_prompt", "") for p in prompts.values()]
+        motion_prompts = [p.get("motion_prompt", "") for p in prompts.values()]
         audio_scripts = [p.get("audio_script", "") for p in prompts.values()]
-        voice_params = prompts.get("voice_params", {"voice": "adam"})
+        voice_params = prompts.get("voice_params", {})
 
         if not image_prompts or not audio_scripts:
-            raise ValueError("Invalid prompts format")
+            raise ValueError("Invalid prompts format: missing imagen_prompt/audio_script")
 
-        start_time = datetime.now()
-
-        # Create tasks for parallel execution
-        images_task = asyncio.create_task(self.generate_image_batch(image_prompts))
+        start = datetime.now()
         audios_task = asyncio.create_task(self.generate_audio_batch(audio_scripts, voice_params))
 
-        # Wait for both to complete
-        images = await images_task
-        audios = await audios_task
+        if self.config.enable_video:
+            # FLUX URLs → Seedance → local mp4
+            image_urls = await self.generate_image_url_batch(image_prompts)
+            videos = await self.generate_video_batch(image_urls, motion_prompts)
+            images: Dict[str, str] = {}  # not needed; compositor uses videos
+        else:
+            # Original Phase 2 path: download images, no Seedance.
+            images = await self.generate_image_batch(image_prompts)
+            videos = {}
 
-        elapsed = (datetime.now() - start_time).total_seconds() / 60
+        audios = await audios_task
+        elapsed = (datetime.now() - start).total_seconds() / 60
+
+        n_scenes = len(image_prompts)
+        primary_count = len(videos) if self.config.enable_video else len(images)
+        status = "completed" if primary_count == n_scenes and len(audios) == n_scenes else "partial"
 
         resultado = {
             "imagenes": images,
+            "videos": videos,
             "audios": audios,
             "metadata": {
-                "total_escenas": len(images),
+                "total_escenas": n_scenes,
                 "elapsed_minutes": round(elapsed, 1),
                 "timestamp": datetime.now().isoformat(),
-                "status": "completed" if len(images) == len(image_prompts) else "partial"
-            }
+                "status": status,
+                "enable_video": self.config.enable_video,
+            },
         }
 
-        logger.info("="*70)
-        logger.info(f"✅ ORCHESTRATION COMPLETE")
-        logger.info(f"   Duration: {elapsed:.1f} minutes")
-        logger.info(f"   Images: {len(images)}/{len(image_prompts)}")
-        logger.info(f"   Audios: {len(audios)}/{len(audio_scripts)}")
-        logger.info("="*70)
-
+        logger.info("=" * 70)
+        logger.info(f"✅ ORCHESTRATION {status.upper()}")
+        logger.info(f"   Duration: {elapsed:.1f} min")
+        if self.config.enable_video:
+            logger.info(f"   Videos: {len(videos)}/{n_scenes}")
+        else:
+            logger.info(f"   Images: {len(images)}/{n_scenes}")
+        logger.info(f"   Audios: {len(audios)}/{n_scenes}")
+        logger.info("=" * 70)
         return resultado
 
-    async def validate_outputs(self, output_dict: Dict[str, Dict]) -> bool:
-        """Validate that all outputs exist and are accessible"""
-        images = output_dict.get("imagenes", {})
-        audios = output_dict.get("audios", {})
+    async def validate_outputs(self, output_dict: Dict) -> bool:
+        """Confirm primary outputs exist on disk."""
+        videos = output_dict.get("videos", {}) or {}
+        images = output_dict.get("imagenes", {}) or {}
+        audios = output_dict.get("audios", {}) or {}
+
+        primary = videos if videos else images
 
         logger.info("🔍 Validating outputs...")
-
-        for key, path in {**images, **audios}.items():
-            if not Path(path).exists():
-                logger.error(f"❌ Missing: {path}")
-                return False
-
+        for d in (primary, audios):
+            for key, path in d.items():
+                if not Path(path).exists():
+                    logger.error(f"❌ Missing: {path}")
+                    return False
+        if not primary or not audios:
+            logger.error("❌ No primary visuals or audios produced")
+            return False
         logger.info("✅ All outputs validated")
         return True

@@ -54,45 +54,143 @@ class VideoCompositor:
     def compose_with_audio(self, elementos: Dict[str, Dict],
                           background_music: Optional[str] = None,
                           scene_duration: float = 12.0) -> str:
-        """
-        Compose video from images and audios using filter_complex.
+        """Compose final video from per-scene inputs.
 
-        Each scene: still image looped for the duration of its scene audio,
-        then all scenes concatenated to a single timeline. Scene duration =
-        the scene's audio length, or scene_duration if audio is missing.
+        Two input modes — auto-detected from `elementos`:
+
+        1. Video clips (elementos["videos"] populated):
+           Each scene is a real mp4 from Seedance. We replace its silent (or
+           non-existent) audio track with the matching MiniMax mp3 and concat
+           all scenes. Scene duration = clip duration. Audio is trimmed to
+           clip length if longer (loudnorm earlier ensures levels match).
+
+        2. Still images (elementos["imagenes"] populated, no videos):
+           Original Phase 2 path — loop each image for its audio's duration
+           and concat. Used when --no-video.
 
         Input: {
-            "imagenes": {"escena_1": "path1.jpg", ...},
-            "audios": {"escena_1": "path1.mp3", ...},
+            "videos":   {"escena_1": "clip1.mp4", ...},  # optional
+            "imagenes": {"escena_1": "img1.jpg", ...},   # optional
+            "audios":   {"escena_1": "aud1.mp3", ...},
             "metadata": {...}
         }
         """
-        logger.info("="*70)
+        logger.info("=" * 70)
         logger.info("🎬 VIDEO COMPOSITION START")
-        logger.info("="*70)
+        logger.info("=" * 70)
 
-        images = elementos.get("imagenes", {})
-        audios = elementos.get("audios", {})
+        videos = elementos.get("videos") or {}
+        images = elementos.get("imagenes") or {}
+        audios = elementos.get("audios") or {}
 
-        if not images or not audios:
-            raise ValueError("Missing images or audios")
+        if not audios:
+            raise ValueError("Missing audios")
+        if not videos and not images:
+            raise ValueError("Missing both videos and images — nothing to compose")
 
-        # Pair scenes in deterministic key order and resolve durations.
+        if videos:
+            logger.info(f"🎨 Compose path: video clips ({len(videos)} scenes)")
+            return self._compose_from_clips(videos, audios)
+        logger.info(f"🎨 Compose path: still images ({len(images)} scenes)")
+        return self._compose_from_images(images, audios, scene_duration)
+
+    def _compose_from_clips(
+        self, videos: Dict[str, str], audios: Dict[str, str]
+    ) -> str:
+        """Per-scene mux (clip + audio) then concat-demux the scenes.
+
+        Splitting the work this way avoids the OOM we saw with a single 6-input
+        filter_complex graph. Each scene's mux is bounded in memory; the final
+        concat-demuxer step just copies streams, so it's fast and light.
+
+        Audio is padded with silence (via `apad`) to be at least as long as
+        the clip, and `-shortest` makes the output end at the clip's natural
+        end. If MiniMax overran the clip duration, the tail is trimmed.
+        """
+        keys = sorted(videos.keys())
+
+        # 1. One scene mp4 per (clip, audio) pair — uniform codec/res/sar so
+        #    concat-demuxer can stream-copy them.
+        scene_files: List[Path] = []
+        for idx, key in enumerate(keys, start=1):
+            clip = Path(videos[key]).resolve()
+            audio_path_str = audios.get(key, "")
+            audio = Path(audio_path_str).resolve() if audio_path_str else None
+            scene_file = self.work_dir / f"scene_{idx:02d}.mp4"
+
+            input_args = ["-i", str(clip)]
+            if audio and audio.exists():
+                input_args += ["-i", str(audio)]
+                audio_filter = "[1:a]aresample=48000,apad[aout]"
+                audio_map = ["-map", "[aout]"]
+            else:
+                input_args += [
+                    "-f", "lavfi",
+                    "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                ]
+                audio_filter = "[1:a]aresample=48000[aout]"
+                audio_map = ["-map", "[aout]"]
+
+            cmd = ["ffmpeg", "-y"] + input_args + [
+                "-filter_complex",
+                "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[vout];"
+                + audio_filter,
+                "-map", "[vout]",
+                *audio_map,
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-shortest",
+                str(scene_file),
+            ]
+            logger.info(f"🎨 Compose scene {idx}/{len(keys)}: {clip.name} + {audio.name if audio else 'silence'}")
+            try:
+                subprocess.run(cmd, capture_output=True, check=True, timeout=900)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"❌ Scene {idx} mux failed: {e.stderr.decode()[-800:]}")
+                raise
+            scene_files.append(scene_file)
+
+        # 2. Concat the uniform scenes via the demuxer (stream copy = fast).
+        concat_list = self.work_dir / "concat.txt"
+        concat_list.write_text("".join(f"file '{f.resolve()}'\n" for f in scene_files))
+
+        output_video = self.work_dir / "composed_raw.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(output_video),
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, check=True, timeout=600)
+            logger.info(f"✅ Concatenated {len(scene_files)} scenes → {output_video}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Concat failed: {e.stderr.decode()[-800:]}")
+            raise
+
+        # 3. Branding pass (watermark; falls back to copy if drawtext fails).
+        logger.info("🎨 Applying Morena branding...")
+        branded_video = self.work_dir / "composed_branded.mp4"
+        self.apply_branding(str(output_video), str(branded_video))
+        return str(branded_video)
+
+    def _compose_from_images(
+        self,
+        images: Dict[str, str],
+        audios: Dict[str, str],
+        scene_duration: float,
+    ) -> str:
+        """Original Phase 2 path: loop each still image over its audio."""
         scenes = []
         for key in sorted(images.keys()):
             img_path = Path(images[key]).resolve()
             audio_path_str = audios.get(key, "")
             audio_path = Path(audio_path_str).resolve() if audio_path_str else None
-            if audio_path and audio_path.exists():
-                dur = self._get_audio_duration(str(audio_path))
-            else:
-                dur = scene_duration
+            dur = self._get_audio_duration(str(audio_path)) if audio_path and audio_path.exists() else scene_duration
             scenes.append((img_path, audio_path, dur))
 
-        logger.info(f"🎨 Composing {len(scenes)} scenes via filter_complex...")
-
-        # Build ffmpeg input args: per scene, a looped image and its audio.
-        # Scenes without audio get a silent track of the right duration.
         input_args: List[str] = []
         for img_path, audio_path, dur in scenes:
             input_args += ["-loop", "1", "-t", f"{dur:.3f}", "-i", str(img_path)]
@@ -104,12 +202,11 @@ class VideoCompositor:
                     "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
                 ]
 
-        # Build filter_complex: scale+pad each video to 1920x1080, then concat.
         filter_parts: List[str] = []
         concat_inputs: List[str] = []
         for idx in range(len(scenes)):
-            v_in = idx * 2          # video input index
-            a_in = idx * 2 + 1      # audio input index
+            v_in = idx * 2
+            a_in = idx * 2 + 1
             filter_parts.append(
                 f"[{v_in}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
                 f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{idx}]"
@@ -124,12 +221,8 @@ class VideoCompositor:
         cmd = ["ffmpeg", "-y"] + input_args + [
             "-filter_complex", filter_complex,
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "18",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-ar", "48000",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             str(output_video),
         ]
 
@@ -140,11 +233,9 @@ class VideoCompositor:
             logger.error(f"❌ Composition failed: {e.stderr.decode()[-1000:]}")
             raise
 
-        # Apply branding
         logger.info("🎨 Applying Morena branding...")
         branded_video = self.work_dir / "composed_branded.mp4"
         self.apply_branding(str(output_video), str(branded_video))
-
         return str(branded_video)
 
     def _get_audio_duration(self, audio_path: str) -> float:
