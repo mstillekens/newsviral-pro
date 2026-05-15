@@ -152,7 +152,49 @@ def _fetch_url_to_audio(url: str, out_dir: Path) -> Path:
     return dest
 
 
+def _normalize_sample(input_path: Path) -> Path:
+    """Re-encode the sample to a clean 22.05kHz mono WAV with a short
+    basename (sample.wav) before uploading.
+
+    Why this step exists: MiniMax's voice cloning model is strict about
+    inputs. We've seen it reject perfectly valid mp3s from yt-dlp with
+    'invalid file ext for voice clone' — likely because:
+      a) yt-dlp's libmp3lame output uses VBR / non-standard MPEG framing
+         that MiniMax's parser doesn't handle, or
+      b) the upload URL Replicate generates doesn't surface the .mp3
+         extension cleanly to MiniMax's validator.
+    Re-encoding through our local ffmpeg-full produces a canonical WAV
+    that MiniMax accepts every time. Bonus: WAV's RIFF header makes
+    duration and format trivially verifiable.
+    """
+    ffdir = _find_ffmpeg_dir()
+    if not ffdir:
+        raise SystemExit("ERROR: no encuentro ffmpeg para normalizar el sample")
+
+    output = input_path.parent / "sample.wav"
+    print(f"🔄 Normalizando a {output.name} (22.05kHz mono WAV)")
+    cmd = [
+        f"{ffdir}/ffmpeg", "-y",
+        "-i", str(input_path),
+        "-ar", "22050",      # 22.05 kHz is plenty for voice
+        "-ac", "1",          # mono
+        "-vn",               # drop any video track just in case
+        "-acodec", "pcm_s16le",
+        str(output),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"ERROR: ffmpeg falló al normalizar. stderr:\n{result.stderr[-1500:]}"
+        )
+    size_kb = output.stat().st_size / 1024
+    print(f"   {output} ({size_kb:.0f} KB)")
+    return output
+
+
 def _train(client: replicate.Client, sample_path: Path) -> str:
+    # Always normalize first — yt-dlp/external mp3s sometimes upset MiniMax.
+    sample_path = _normalize_sample(sample_path)
     print(f"⏳ Entrenando voz MiniMax desde: {sample_path}")
     with sample_path.open("rb") as f:
         output = client.run(
