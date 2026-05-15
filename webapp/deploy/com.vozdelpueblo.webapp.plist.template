@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Launchd service for the VOZ DEL PUEBLO webapp.
+
+  Install:
+    1. Edit this file: replace {{PROJECT_DIR}} with the absolute path of the
+       repo on the Mac mini (e.g. /Users/jr/projects/NewsViral).
+    2. Copy to ~/Library/LaunchAgents/com.vozdelpueblo.webapp.plist
+    3. Load it:
+         launchctl unload ~/Library/LaunchAgents/com.vozdelpueblo.webapp.plist 2>/dev/null
+         launchctl load   ~/Library/LaunchAgents/com.vozdelpueblo.webapp.plist
+    4. Verify: launchctl list | grep vozdelpueblo
+    5. Logs:   tail -f {{PROJECT_DIR}}/logs/webapp.stdout.log
+
+  KeepAlive=true means launchd restarts the app if it crashes.
+  RunAtLoad=true means it starts when you load the plist, AND on every login.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vozdelpueblo.webapp</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{PROJECT_DIR}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PROJECT_DIR}}/.venv/bin/uvicorn</string>
+        <string>webapp.server:app</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8000</string>
+        <string>--log-level</string>
+        <string>info</string>
+    </array>
+
+    <!--
+      Env vars are picked up from .env at import time inside webapp/server.py.
+      We DON'T put secrets in this plist because plists are world-readable.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{PROJECT_DIR}}/logs/webapp.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{PROJECT_DIR}}/logs/webapp.stderr.log</string>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

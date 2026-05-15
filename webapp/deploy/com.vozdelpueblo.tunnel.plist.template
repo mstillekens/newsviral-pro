@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Launchd service for the Cloudflare Tunnel that exposes localhost:8000
+  to the internet via your assigned cloudflared tunnel.
+
+  This assumes you already ran:
+    cloudflared tunnel login
+    cloudflared tunnel create voz-del-pueblo
+    cloudflared tunnel route dns voz-del-pueblo <your-subdomain>.<your-domain>
+
+  …or, if you don't own a domain, the simpler --url option works but the URL
+  is RANDOM and CHANGES every restart. We default to the named-tunnel config
+  here; for the random URL alternative, see DEPLOY.md.
+
+  Edit this file: replace {{HOME}} with the home dir on the Mac mini, e.g.
+  /Users/jr — then move to ~/Library/LaunchAgents/.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vozdelpueblo.tunnel</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/cloudflared</string>
+        <string>tunnel</string>
+        <string>run</string>
+        <string>voz-del-pueblo</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TUNNEL_ORIGIN_CERT</key>
+        <string>{{HOME}}/.cloudflared/cert.pem</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/Library/Logs/cloudflared.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/Library/Logs/cloudflared.stderr.log</string>
+</dict>
+</plist>

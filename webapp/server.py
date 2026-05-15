@@ -36,8 +36,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from fastapi import BackgroundTasks, FastAPI, Form, Request, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+import secrets
+from base64 import b64decode
+
+from fastapi import BackgroundTasks, FastAPI, Form, Request, HTTPException, Depends
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -194,6 +197,66 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
             update_state(mark_fail)
 
 
+# ---------- Auth ----------
+#
+# Public hosting requires gating expensive endpoints — Replicate jobs cost
+# real money. We use HTTP Basic auth with a single shared password from the
+# WEBAPP_PASSWORD env var. Set it in .env on the Mac mini and share with
+# friends. If unset, the app falls back to OPEN MODE (logs a warning) so
+# local development still works without auth headaches.
+#
+# Auth scope:
+#   - /         GET  → REQUIRES auth (the swipe UI)
+#   - /refresh  POST → REQUIRES auth
+#   - /decide   POST → REQUIRES auth (this is what costs money)
+#   - /queue           READ-ONLY but auth still required (it shows pending jobs)
+#   - /videos          PUBLIC (anyone with the link can view produced videos)
+#   - /video/<id>      PUBLIC (the actual mp4 — share with friends)
+#   - /health          PUBLIC
+
+WEBAPP_PASSWORD = os.environ.get("WEBAPP_PASSWORD", "").strip()
+WEBAPP_USERNAME = os.environ.get("WEBAPP_USERNAME", "voz").strip()
+
+if not WEBAPP_PASSWORD:
+    logger.warning(
+        "⚠️  WEBAPP_PASSWORD not set — running in OPEN MODE. "
+        "Set it in .env before exposing the app to the public internet."
+    )
+
+
+def require_auth(request: Request) -> None:
+    """Dependency: require HTTP Basic credentials. No-op if no password set."""
+    if not WEBAPP_PASSWORD:
+        return
+
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("basic "):
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": 'Basic realm="Voz del Pueblo"'},
+        )
+    try:
+        decoded = b64decode(header.split(" ", 1)[1]).decode("utf-8")
+        user, _, password = decoded.partition(":")
+    except Exception:
+        raise HTTPException(
+            status_code=401,
+            detail="Malformed credentials",
+            headers={"WWW-Authenticate": 'Basic realm="Voz del Pueblo"'},
+        )
+
+    # Constant-time compare to keep timing leaks off the table.
+    user_ok = secrets.compare_digest(user, WEBAPP_USERNAME)
+    pass_ok = secrets.compare_digest(password, WEBAPP_PASSWORD)
+    if not (user_ok and pass_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Wrong username or password",
+            headers={"WWW-Authenticate": 'Basic realm="Voz del Pueblo"'},
+        )
+
+
 # ---------- App ----------
 
 app = FastAPI(title="VOZ DEL PUEBLO")
@@ -202,7 +265,7 @@ app.mount("/static", StaticFiles(directory=str(ROOT / "webapp" / "static")), nam
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def index(request: Request, _: None = Depends(require_auth)):
     state = load_state()
     run_id = state.get("current_run")
     items = state.get("news_by_run", {}).get(run_id, []) if run_id else []
@@ -220,7 +283,7 @@ async def index(request: Request):
 
 
 @app.post("/refresh", response_class=RedirectResponse)
-async def refresh():
+async def refresh(_: None = Depends(require_auth)):
     """Refetch RSS + score, replace current_run."""
     items = await asyncio.to_thread(
         fetch_google_news, since_days=2, max_items=30, require_region_hit=True
@@ -254,6 +317,7 @@ async def decide(
     background_tasks: BackgroundTasks,
     url: str = Form(...),
     accept: str = Form(...),  # "yes" | "no"
+    _: None = Depends(require_auth),
 ):
     state = load_state()
     accepted = accept == "yes"
@@ -308,7 +372,7 @@ async def decide(
 
 
 @app.get("/queue", response_class=HTMLResponse)
-async def queue_view(request: Request):
+async def queue_view(request: Request, _: None = Depends(require_auth)):
     state = load_state()
     jobs = []
     for jid in state.get("job_order", []):
@@ -319,7 +383,7 @@ async def queue_view(request: Request):
 
 
 @app.get("/api/queue")
-async def queue_json():
+async def queue_json(_: None = Depends(require_auth)):
     """Polled by the queue view for live updates."""
     state = load_state()
     out = []
