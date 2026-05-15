@@ -1,52 +1,69 @@
-# Voice samples
+# Voice samples — fuentes legales para clonar voz chilanga
 
-This directory holds the **reference audio** that gets used to train the
-narrator voice for the newsroom.
+Tres caminos para conseguir un sample de voz mexicana sin grabarte:
 
-## To enable a chilango (Mexico City) accent
+## 1) Mozilla Common Voice (CC0, gratis, calidad variable)
 
-1. Get a 30–60 second WAV/MP3 of clear Mexican Spanish speech.
-   - **Best**: record yourself or someone you know reading a paragraph from a
-     Mexican newspaper. Read naturally — not fast, not theatrical.
-   - **Alternative**: pull a Creative-Commons-licensed clip of a Mexican
-     Spanish speaker from Mozilla Common Voice
-     (commonvoice.mozilla.org/es/datasets), filtered to the `mx_locale`.
-   - Acoustic quality matters more than mic quality: a quiet room and a
-     phone-quality recording usually beats a fancy mic in a noisy room.
+Mozilla Common Voice tiene miles de grabaciones de hablantes mexicanos
+bajo licencia **CC0** (dominio público). Es la fuente más limpia legalmente.
 
-2. Save the file here, e.g. `voice_samples/chilango.wav`.
+```bash
+# Descarga el dataset completo de Spanish: https://commonvoice.mozilla.org/es/datasets
+# (es grande, ~50GB). Más práctico: busca un clip mexicano en su buscador web,
+# guardas el WAV, y pasas el archivo:
+python clone_voice.py --preview voice_samples/common_voice_mx.wav
+```
 
-3. Train:
+**Tip**: filtra por `accent: Mexican` cuando explores. Las grabaciones son
+voluntarias así que la calidad varía — escucha 3-4 antes de elegir.
 
-   ```bash
-   python clone_voice.py voice_samples/chilango.wav
-   ```
+## 2) YouTube con licencia Creative Commons (`yt-dlp`)
 
-   The script uploads the sample to MiniMax via Replicate, returns a
-   `voice_id`, and writes `MINIMAX_VOICE_ID=…` into `.env`. The next pipeline
-   run will use that voice automatically (no code changes needed).
+Muchos creadores mexicanos suben videos bajo licencia CC. Filtra YouTube por
+"Creative Commons" y busca un narrador chilango con voz que te guste.
 
-4. Verify the new voice with a single test video:
+```bash
+brew install yt-dlp                          # una vez
+python clone_voice.py --preview "https://www.youtube.com/watch?v=XXXXX"
+```
 
-   ```bash
-   python news_viral_pro.py --auto 1 --max 4
-   ```
+El script extrae 30 segundos de audio (segundo 5 al 35 — salta intros), lo
+entrena, y genera un preview para que escuches antes de comprometerlo.
 
-## Constraints (from MiniMax)
+**Advertencia**: aunque YouTube te dé el video bajo CC, la voz como tal es un
+derecho de personalidad. Para uso comercial pide permiso al creador si la
+voz es identificable como suya. Para clonar el "estilo" general de un acento
+chilango y usarlo en otro contenido, normalmente es uso transformativo.
 
-- Format: MP3, M4A, or WAV.
-- Duration: 10 s minimum, 5 min maximum.
-- Size: under 20 MB.
-- Single speaker, no music, minimal background noise.
+## 3) Podcasts mexicanos con licencia abierta
 
-## What "good" sounds like
+Plataformas como Anchor / Spotify a veces tienen episodios CC-BY. Busca:
 
-- Clean diction without slurring.
-- Natural pace (about 140–160 words per minute).
-- Includes a range of tones (a few questions or emphatic moments are great).
-- Recorded in mono or stereo at 22 kHz+ sample rate.
+- *La Octava* (algunos episodios libres)
+- *Radio Educación* (parte del catálogo es dominio público — radio pública)
+- Podcasts indie chilangos que indiquen "uso libre" en su descripción
 
-## Reverting to the default voice
+```bash
+python clone_voice.py --preview "https://podcast.example.com/ep42.mp3"
+```
 
-Remove (or comment out) `MINIMAX_VOICE_ID` from `.env`. The pipeline falls
-back to `English_Wiselady` with `language_boost=Spanish`.
+## Recomendación práctica
+
+1. Empieza con `--preview` siempre. Eso te da un audio de prueba sin tocar
+   el `.env`.
+2. Una vez te guste cómo suena, corre el mismo comando sin `--preview` para
+   activar esa voz en el pipeline.
+3. Puedes tener varios `MINIMAX_VOICE_ID_*` archivados (rename del campo en
+   `.env`) y rotar entre ellos para tener varias voces de noticiero.
+
+## Constraints técnicos (MiniMax)
+
+- Formato: MP3, M4A, o WAV.
+- Duración: 10 s mínimo, 5 min máximo.
+- Tamaño: < 20 MB.
+- Un solo hablante, sin música de fondo, idealmente cuarto silencioso.
+
+## Revertir a la voz default
+
+Borra (o comenta) `MINIMAX_VOICE_ID` en `.env`. El pipeline vuelve a usar
+`English_Wiselady` con `language_boost=Spanish`.
