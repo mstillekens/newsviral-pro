@@ -73,5 +73,8 @@ video_output/
 *.log
 logs/
 
+# Learned data (per-user)
+score_weights.json
+
 # Node modules (if needed)
 node_modules/

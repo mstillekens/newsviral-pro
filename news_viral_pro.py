@@ -1,23 +1,43 @@
-"""NewsViral PRO — Voz del Pueblo. Async pipeline orchestrator."""
+"""NewsViral PRO — Voz del Pueblo. Async pipeline orchestrator.
+
+Demo flow:
+  1. tarea_1_research → fetch QR/Cancún/RM news from Google News RSS,
+     score by virality heuristic.
+  2. CLI selection prompt → user accepts/rejects each ranked item.
+  3. tarea_2_script → for each accepted item, generate a 3-scene first-person
+     Spanish script via Claude (with persona variation).
+  4. tarea_3_prompts → (already done by script_writer; this just adapts the
+     shape).
+  5. tarea_4_replicate_pro → parallel FLUX + Minimax.
+  6. tarea_5_componer_video_pro → FFmpeg compose.
+  7. Update score weights from Y/N decisions for the next run.
+
+Everything is logged under logs/runs/<timestamp>/.
+"""
 import argparse
 import asyncio
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from web_dashboard import ProgressTracker
 from replicate_orchestrator import ReplicateOrchestrator, ReplicateConfig
 from video_compositor import VideoCompositor, BrandingConfig
+from news_sources import NewsItem, fetch_google_news, filter_by_date, enrich_with_body
+from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
+from script_writer import Script, ScriptWriter
+from run_logger import RunLogger
 
 
 # ---------- Logger ----------
 
 class _ViralLogger:
-    """Thin wrapper over stdlib logging that adds .success() and a tiempo= kwarg.
-
-    `tiempo=True` prefixes the message with a wall-clock timestamp."""
+    """Thin wrapper over stdlib logging that adds .success() and a tiempo= kwarg."""
 
     def __init__(self) -> None:
         logging.basicConfig(
@@ -51,40 +71,142 @@ logger = _ViralLogger()
 class ConfigPro:
     """Runtime configuration for the NewsViral PRO pipeline."""
     replicate_api_token: str = ""
+    anthropic_api_key: str = ""
     colores_morena: Dict[str, str] = field(default_factory=lambda: {
-        "primary": "#235B4E",  # Verde Morena
-        "accent": "#9F2241",   # Rojo Morena
+        "primary": "#235B4E",
+        "accent": "#9F2241",
         "bg": "#000000",
     })
     scene_count: int = 3
     voice: str = "adam"
+    # Demo controls
+    since_days: int = 2
+    max_items: int = 12
+    date_filter: Optional[str] = None       # "YYYY-MM-DD" UTC day filter
+    auto_accept_top: int = 0                # >0: skip CLI, accept top-N automatically
+    script_model: str = "claude-haiku-4-5"
 
 
-# ---------- Task stubs (Phase 1 placeholders) ----------
+# ---------- Tareas 1-3: news → script ----------
 
-async def tarea_1_research(config: ConfigPro) -> Dict[str, Any]:
-    logger.info("🔎 TAREA 1: Research (stub)", tiempo=True)
-    await asyncio.sleep(0.01)
-    return {"topic": "demo", "sources": []}
+async def tarea_1_research(config: ConfigPro, run_log: RunLogger) -> List[ScoredItem]:
+    """Fetch + score news. Synchronous under the hood; wrapped async to keep
+    the orchestrator shape consistent."""
+    logger.info("🔎 TAREA 1: Research (noticias QR)", tiempo=True)
+
+    items = await asyncio.to_thread(
+        fetch_google_news,
+        since_days=config.since_days,
+        max_items=max(config.max_items * 3, 30),
+        require_region_hit=True,
+    )
+
+    if config.date_filter:
+        items = filter_by_date(items, config.date_filter)
+        logger.info(f"🗓  Filtered to date {config.date_filter}: {len(items)} items")
+
+    run_log.fetched(items)
+
+    weights = load_weights()
+    scored = score_items(items, weights)
+    scored = scored[: config.max_items]
+    run_log.scored(scored)
+
+    logger.success(f"{len(scored)} noticias ranqueadas")
+    return scored
 
 
-async def tarea_2_script(research: Dict[str, Any], config: ConfigPro) -> Dict[str, Any]:
-    logger.info("✍️  TAREA 2: Script (stub)", tiempo=True)
-    await asyncio.sleep(0.01)
-    return {"scenes": [{"text": f"Escena {i+1}"} for i in range(config.scene_count)]}
+def _format_card(idx: int, total: int, scored: ScoredItem) -> str:
+    item = scored.item
+    bd = scored.breakdown
+    when = item.published_at[:16].replace("T", " ")
+    title = item.title[:140]
+    snippet = (item.snippet or "")[:200]
+    region = ", ".join(item.region_hits) or "—"
+    breakdown_str = " ".join(f"{k}={v:+.2f}" for k, v in bd.items())
+    return (
+        f"\n┌─ [{idx}/{total}] score {scored.score:.2f} ─────────────────────────\n"
+        f"│ {title}\n"
+        f"│ {item.source} · {when} · {region}\n"
+        f"│ {snippet}\n"
+        f"│ {breakdown_str}\n"
+        f"│ {item.url}\n"
+        f"└─ [S]í   [N]o   [Q]uit"
+    )
 
 
-async def tarea_3_prompts(script: Dict[str, Any], config: ConfigPro) -> Dict[str, Any]:
-    logger.info("🎯 TAREA 3: Prompts (stub)", tiempo=True)
-    await asyncio.sleep(0.01)
-    return {
-        f"escena_{i+1}": {
-            "imagen_prompt": f"Photo-realistic news scene {i+1}, Mexico, cinematic",
-            "audio_script": f"Esta es la escena número {i+1}.",
-        }
-        for i in range(config.scene_count)
-    }
+def select_news_cli(scored_items: List[ScoredItem], config: ConfigPro) -> List[Tuple[NewsItem, bool]]:
+    """Present each scored item, collect Y/N decisions. Returns the FULL list
+    of (item, accepted) decisions — accepted=False included — so the scorer
+    can learn from rejections too."""
+    if config.auto_accept_top > 0:
+        decisions: List[Tuple[NewsItem, bool]] = []
+        for i, s in enumerate(scored_items):
+            decisions.append((s.item, i < config.auto_accept_top))
+        logger.info(f"🤖 auto_accept_top={config.auto_accept_top}: skipping CLI prompt")
+        return decisions
 
+    total = len(scored_items)
+    decisions = []
+    for idx, s in enumerate(scored_items, start=1):
+        print(_format_card(idx, total, s))
+        while True:
+            try:
+                ans = input("→ ").strip().lower()
+            except EOFError:
+                ans = "q"
+            if ans in ("s", "y", "yes", "si", "sí"):
+                decisions.append((s.item, True))
+                break
+            if ans in ("n", "no"):
+                decisions.append((s.item, False))
+                break
+            if ans in ("q", "quit"):
+                for remaining in scored_items[idx-1:]:
+                    decisions.append((remaining.item, False))
+                return decisions
+            print("  (responde s/n/q)")
+    return decisions
+
+
+async def tarea_2_3_scripts_and_prompts(
+    accepted: List[NewsItem],
+    config: ConfigPro,
+    run_log: RunLogger,
+) -> List[Script]:
+    """TAREAS 2+3 merged: enrich each accepted item with its full body (Sipse
+    scraper) when possible, then call Claude to write the 3-scene script.
+    The script already contains imagen_prompt + audio_script per scene, so
+    there's no separate tarea_3."""
+    if not accepted:
+        return []
+
+    logger.info("✍️  TAREA 2-3: Scripts + Prompts (Claude)", tiempo=True)
+
+    # Scrape full bodies in parallel.
+    enriched = await asyncio.gather(*[
+        asyncio.to_thread(enrich_with_body, item) for item in accepted
+    ])
+
+    writer = ScriptWriter(
+        api_key=config.anthropic_api_key,
+        model=config.script_model,
+    )
+
+    scripts: List[Script] = []
+    for item in enriched:
+        try:
+            script = await asyncio.to_thread(writer.write, item)
+            scripts.append(script)
+        except Exception as e:
+            logger.error(f"Script failed for «{item.title[:60]}»: {e}")
+
+    run_log.scripts(scripts)
+    logger.success(f"{len(scripts)} guiones generados")
+    return scripts
+
+
+# ---------- Tareas 4-5 (unchanged from Phase 2) ----------
 
 async def tarea_4_replicate_pro(
     prompts: Dict[str, Any],
@@ -99,20 +221,14 @@ async def tarea_4_replicate_pro(
             api_token=config.replicate_api_token or os.getenv("REPLICATE_API_TOKEN", ""),
             skip_replicate=skip_replicate,
         )
-
         orchestrator = ReplicateOrchestrator(replicate_config)
-
         elementos = await orchestrator.orchestrate_parallel(prompts, config)
-
         is_valid = await orchestrator.validate_outputs(elementos)
-
         if is_valid:
-            logger.success("✅ Replicate orchestration complete")
+            logger.success("Replicate orchestration complete")
             return elementos
-        else:
-            logger.error("Validation failed")
-            return None
-
+        logger.error("Validation failed")
+        return None
     except Exception as e:
         logger.error(f"Error Tarea 4: {str(e)}")
         return None
@@ -128,62 +244,163 @@ async def tarea_5_componer_video_pro(
     try:
         branding = BrandingConfig(colors=config.colores_morena)
         compositor = VideoCompositor(branding)
-
         composed_video = compositor.compose_with_audio(elementos)
-
         resultado = compositor.export_mp4(composed_video)
-
-        logger.success(f"✅ Video final: {resultado['video_path']}")
+        logger.success(f"Video final: {resultado['video_path']}")
         return resultado
-
     except Exception as e:
         logger.error(f"Error Tarea 5: {str(e)}")
         return None
 
 
-# ---------- Entrypoint ----------
+# ---------- Per-news video production ----------
 
-async def run(mock: bool) -> int:
-    config = ConfigPro(replicate_api_token=os.getenv("REPLICATE_API_TOKEN", ""))
-    tracker = ProgressTracker()
+async def produce_video_for_script(
+    idx: int,
+    script: Script,
+    news_title: str,
+    config: ConfigPro,
+    run_log: RunLogger,
+    mock: bool,
+) -> Optional[Dict[str, Any]]:
+    """Run TAREA 4 + 5 for one news item's script, copy the resulting mp4 into
+    the per-run log dir, and return the result metadata."""
+    logger.info(f"━━━ Video #{idx}: «{news_title[:70]}» (persona={script.persona_id}) ━━━")
 
-    tracker.start("research")
-    research = await tarea_1_research(config)
-    tracker.done("research")
+    prompts = script.to_prompts_dict()
 
-    tracker.start("script")
-    script = await tarea_2_script(research, config)
-    tracker.done("script")
-
-    tracker.start("prompts")
-    prompts = await tarea_3_prompts(script, config)
-    tracker.done("prompts")
-
-    tracker.start("replicate")
     elementos = await tarea_4_replicate_pro(prompts, config, skip_replicate=mock)
     if elementos is None:
-        tracker.fail("replicate", "no elementos returned")
-        logger.error("Pipeline halted at TAREA 4")
-        return 1
-    tracker.done("replicate")
+        return None
 
-    tracker.start("compose")
     resultado = await tarea_5_componer_video_pro(elementos, config)
     if resultado is None:
-        tracker.fail("compose", "compose returned None")
-        logger.error("Pipeline halted at TAREA 5")
-        return 1
-    tracker.done("compose", message=str(resultado.get("video_path", "")))
+        return None
 
-    logger.success(f"Pipeline complete: {resultado.get('video_path', '?')}")
-    return 0
+    src_video = Path(resultado["video_path"])
+    archived = run_log.video(idx, news_title, resultado, src_video)
+    resultado["archived_path"] = str(archived)
+    return resultado
+
+
+# ---------- Entrypoint ----------
+
+async def run(config: ConfigPro, mock: bool) -> int:
+    run_log = RunLogger()
+    tracker = ProgressTracker()
+
+    # 1. Research + score
+    tracker.start("research")
+    scored = await tarea_1_research(config, run_log)
+    tracker.done("research", message=f"{len(scored)} items")
+
+    if not scored:
+        logger.error("No hay noticias después del filtro. Revisa --date o --since-days.")
+        return 1
+
+    # 2. CLI selection
+    tracker.start("select")
+    decisions = select_news_cli(scored, config)
+    accepted_items = [item for item, ok in decisions if ok]
+    run_log.selected([
+        {"url": it.url, "title": it.title, "accepted": ok}
+        for it, ok in decisions
+    ])
+    tracker.done("select", message=f"{len(accepted_items)}/{len(decisions)} aceptadas")
+    logger.info(f"📥 {len(accepted_items)} noticias seleccionadas para video")
+
+    # 3. Update weights from feedback (do this BEFORE generating videos so
+    #    even if the rest fails, learning persists).
+    new_weights = update_weights_from_feedback(load_weights(), decisions)
+    save_weights(new_weights)
+    logger.info("🧠 Pesos del scorer actualizados (score_weights.json)")
+
+    if not accepted_items:
+        run_log.summary({
+            "timestamp": run_log.timestamp,
+            "fetched": len(scored),
+            "accepted": 0,
+            "videos_produced": 0,
+        })
+        logger.info("Ninguna noticia aceptada. Nada que generar.")
+        return 0
+
+    # 4. Scripts + prompts via Claude
+    tracker.start("scripts")
+    scripts = await tarea_2_3_scripts_and_prompts(accepted_items, config, run_log)
+    tracker.done("scripts", message=f"{len(scripts)} scripts")
+
+    # 5. Per-script: Replicate + FFmpeg
+    tracker.start("videos")
+    produced: List[Dict[str, Any]] = []
+    for idx, (item, script) in enumerate(zip(accepted_items[: len(scripts)], scripts), start=1):
+        result = await produce_video_for_script(idx, script, item.title, config, run_log, mock)
+        if result:
+            produced.append(result)
+    tracker.done("videos", message=f"{len(produced)} videos")
+
+    # 6. Summary
+    run_log.summary({
+        "timestamp": run_log.timestamp,
+        "fetched": len(scored),
+        "accepted": len(accepted_items),
+        "scripts_generated": len(scripts),
+        "videos_produced": len(produced),
+        "videos": [r.get("archived_path") or r.get("video_path") for r in produced],
+        "mock": mock,
+        "script_model": config.script_model,
+    })
+
+    logger.success(
+        f"Demo terminó. {len(produced)} videos en {run_log.dir}/"
+    )
+    return 0 if produced or not accepted_items else 1
+
+
+def _load_env_file(path: Path = Path(".env")) -> None:
+    """Load KEY=VALUE pairs from .env. Overrides empty environment values
+    (Claude Code and some shells export ANTHROPIC_API_KEY="") but does NOT
+    override a meaningfully-set env var, so callers can still pass a key
+    inline."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        if not os.environ.get(k):
+            os.environ[k] = v
 
 
 def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--mock", action="store_true", help="Skip real Replicate calls")
+    _load_env_file()
+
+    p = argparse.ArgumentParser(description="NewsViral PRO demo runner")
+    p.add_argument("--mock", action="store_true", help="Skip real Replicate calls (no media generated)")
+    p.add_argument("--date", default=None, help="Only consider news from this UTC date (YYYY-MM-DD)")
+    p.add_argument("--since-days", type=int, default=2, help="How many days back to fetch")
+    p.add_argument("--max", type=int, default=12, help="Max items to score & show")
+    p.add_argument("--auto", type=int, default=0, help="Skip CLI prompt, auto-accept the top N scored items")
+    p.add_argument("--model", default="claude-haiku-4-5", help="Anthropic model for script writing")
     args = p.parse_args()
-    raise SystemExit(asyncio.run(run(mock=args.mock)))
+
+    config = ConfigPro(
+        replicate_api_token=os.environ.get("REPLICATE_API_TOKEN", ""),
+        anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+        since_days=args.since_days,
+        max_items=args.max,
+        date_filter=args.date,
+        auto_accept_top=args.auto,
+        script_model=args.model,
+    )
+
+    if not config.anthropic_api_key and not args.mock:
+        print("ERROR: ANTHROPIC_API_KEY no configurado. Pon uno en .env o usa --mock.", file=sys.stderr)
+        raise SystemExit(2)
+
+    raise SystemExit(asyncio.run(run(config, mock=args.mock)))
 
 
 if __name__ == "__main__":
