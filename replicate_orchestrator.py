@@ -264,9 +264,22 @@ class ReplicateOrchestrator:
         logger.info(f"✅ Audios: {len(out)}/{len(scripts)}")
         return out
 
+    # MiniMax speech-02-hd's full emotion enum, validated empirically.
+    _VALID_EMOTIONS = {
+        "auto", "happy", "sad", "angry", "fearful",
+        "disgusted", "surprised", "calm", "fluent", "neutral",
+    }
+
     async def _generate_single_audio(
         self, script: str, index: int, voice_params: Dict, emotion: str = "auto"
     ) -> str:
+        # If Claude (or the caller) gave us a non-canonical emotion (e.g.
+        # 'curious', 'excited'), MiniMax will hard-reject. Fall back to 'auto'
+        # so a bad label never costs us the audio for a scene.
+        if emotion not in self._VALID_EMOTIONS:
+            logger.warning(f"emotion {emotion!r} not in MiniMax enum, falling back to 'auto'")
+            emotion = "auto"
+
         for attempt in range(self.config.max_retries):
             try:
                 await self.rate_limiter.acquire()

@@ -1,168 +1,112 @@
-"""Claude-powered script writer for viral news videos.
+"""Claude-powered script writer for the VOZ DEL PUEBLO newsroom.
 
-Voice direction:
-- Mexican Spanish, barrio energy (Tepito-flavored — Lourdes Ruiz "La Reina del
-  Albur" is the spiritual inspiration). Drama presente sin telenovela.
-- First person, present tense.
-- Slang chilango permitido: "no manches", "ay mi rey", "mira nomás",
-  "ándale", "nel", "cabrón" (light, no albur explícito).
-- NEVER invents facts not in the source. Drama is in HOW, not WHAT.
+Three things this module does differently from prior versions:
 
-The script is 3 scenes. Each scene has:
-- `imagen_prompt` (English, photo-realistic, for FLUX) — describes the *base
-  frame* the scene starts from.
-- `motion_prompt` (English, for Seedance) — describes what HAPPENS in those
-  5 seconds: camera move, subject motion, lighting shift.
-- `audio_script` (Spanish, 12–18 words, ~5s spoken) — what the narrator says
-  over that clip.
+1. ANCHOR-DRIVEN: every script features a recurring anchor character chosen
+   by news vertical (política → Don Polibruh, chismes → Doña Chispas, etc.).
+   Scenes 1 and 3 are the anchor speaking to camera; scene 2 is the news
+   event itself. The anchor's branded uniform carries the newsroom identity
+   into every frame.
 
-Output is strict JSON, no markdown.
+2. STYLE-AWARE: the visual aesthetic (documentary, caricature, comic book,
+   noir, looney tunes…) is injected into FLUX + Seedance prompts via a
+   StyleVariant from brand_style. Same script structure, different look.
+
+3. INTRIGUE-FIRST: instructions emphasize psychological hooks and a
+   cliffhanger close. The narrator plants questions, withholds details, and
+   leaves the audience wanting the rest of the story. Drama is suggested,
+   not shouted.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-import random
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Dict, Optional
 
 from anthropic import Anthropic
 
 from news_sources import NewsItem
+from brand_style import AnchorCharacter, StyleVariant, STYLE_VARIANTS, anchor_for
 
 logger = logging.getLogger(__name__)
 
 
-PERSONAS = [
-    {
-        "id": "lourdes_tepito",
-        "voice": (
-            "Eres una mujer madura de Tepito, callejera, con voz cargada de "
-            "experiencia. Inspírate en Lourdes Ruiz, la Reina del Albur — "
-            "PERO sin albur explícito ni doble sentido sexual. Hablas directo, "
-            "con drama mexicano, sabes vender la nota. Usas frases como "
-            "'mira nomás', 'no manches', 'ay mi rey', 'ándale', 'pélame'. "
-            "Tono: confianza absoluta, callejera fina, picaresca pero limpia."
-        ),
-        "opener_examples": [
-            "Mira nomás lo que se acaba de armar aquí...",
-            "Ay mi rey, no te vas a creer lo que está pasando...",
-            "Pélame tantito, porque esto está cabrón...",
-        ],
-    },
-    {
-        "id": "dona_sabia",
-        "voice": (
-            "Eres una señora mayor del barrio, doña sabia que lo ha visto "
-            "todo. Hablas con autoridad cariñosa, mexicana, en primera "
-            "persona. Dramatizas pero con experiencia, no con escándalo. "
-            "Usas 'mi hija/o', 'fíjate', 'ándale', 'desde que tengo memoria'."
-        ),
-        "opener_examples": [
-            "Fíjate mi hijo, llevo viviendo aquí más de cuarenta años y...",
-            "Desde la ventana de mi cocina alcanzo a ver todo y te juro que...",
-            "Mira, yo no me meto en lo que no me importa, pero esto sí...",
-        ],
-    },
-    {
-        "id": "cronista_de_barrio",
-        "voice": (
-            "Eres un reportero callejero mexicano, mid-30s, en escena. "
-            "Hablas como periodista pero con calle: directo, irónico, con "
-            "frases cortas. Drama controlado. Usas 'a ver', 'ojo', 'aquí "
-            "entre nos', 'no se diga más'. Te paras donde pasó la nota."
-        ),
-        "opener_examples": [
-            "A ver, aquí entre nos: estoy parado a dos cuadras y veo que...",
-            "Ojo: lo que les voy a contar acaba de pasar hace minutos...",
-            "Vine corriendo porque me hablaron y mira lo que me encuentro...",
-        ],
-    },
-    {
-        "id": "cuate_del_tepito",
-        "voice": (
-            "Eres un chavo de barrio, 25-30 años, energía juvenil mexicana. "
-            "Hablas en primera persona con tono de cuate confiando un chisme. "
-            "Drama joven, intenso pero con humor seco. 'No mames', 'qué pedo' "
-            "(sin grosería fuerte), 'va', 'simón', 'cero broma', 'neta'."
-        ),
-        "opener_examples": [
-            "Neta neta neta, no van a creer lo que acabo de ver...",
-            "Cero broma compa, me asomo a la ventana y...",
-            "Simón, estaba yo tranquilo y de repente...",
-        ],
-    },
-]
+# Kept for backwards-compat with code that imports PERSONAS; map ids to
+# anchor ids (legacy callers picked a persona by id).
+PERSONAS = []  # deprecated; left empty to avoid breakage on import
 
 
-def pick_persona(seed: Optional[str] = None) -> Dict:
-    if seed is not None:
-        rng = random.Random(seed)
-        return rng.choice(PERSONAS)
-    return random.choice(PERSONAS)
+SYSTEM_PROMPT_TEMPLATE = """Eres guionista jefe del noticiero "VOZ DEL PUEBLO". Cada video lo presenta un personaje ANCLA recurrente que tiene su propia voz, ropa de noticiero, y forma de hablar. La nota se la pasa por delante a él/ella, y narra la historia primero como gancho, después muestra el evento, después cierra con intriga.
+
+ANCLA DE ESTA NOTA:
+- Nombre: {anchor_name}
+- Voz / tono: {anchor_voice}
+- Cierra siempre con su frase signature: "{anchor_closing}"
+
+ESTRUCTURA OBLIGATORIA (3 escenas):
+- Escena 1: APARECE EL ANCLA hablándole a cámara, planteando la nota como quien te jala a la conversación. Termina con un hook abierto, una pregunta que NO contestas todavía.
+- Escena 2: SIN ANCLA. Es la imagen del evento mismo (la noticia visualizada). El audio sigue narrando lo que estás viendo.
+- Escena 3: VUELVE EL ANCLA, ahora reaccionando a lo que se acaba de mostrar. Cierra con su frase signature literal o casi literal, dejando aire para que la audiencia se quede pensando.
+
+PSICOLOGÍA — INTRIGA, NO DRAMA:
+1. SIEMPRE primera persona del ancla ("yo", "veo", "te cuento").
+2. Tiempo presente / presente continuo.
+3. Tono CONVERSACIONAL, casi en voz baja, como chisme con un amigo. Drama controlado.
+4. PROHIBIDO: "última hora", "no vas a creer", "increíble", "alerta máxima", exclamaciones huecas.
+5. PROHIBIDO inventar hechos, quotes, montos, o atribuciones a personas reales.
+6. PLANTA preguntas abiertas. ESCONDE detalles deliberadamente. La audiencia tiene que querer la historia completa.
+7. Slang chilango ñero permitido y deseable: "ojo", "fíjate", "mira nomás", "aquí entre nos", "no manches", "ándale". Sin albur, sin grosería fuerte.
+8. CADA ESCENA con apertura sintáctica DISTINTA — no repitas estructura.
+
+ESTILO VISUAL DE TODA LA SALIDA ({style_name}):
+{style_desc}
+
+ESTRUCTURA POR ESCENA (campos exigidos):
+- imagen_prompt: English. SI es escena 1 o 3, incluye al ancla con su descripción visual completa de uniforme. SI es escena 2, describe el evento sin el ancla. Termina SIEMPRE con: "{style_flux_suffix}".
+- motion_prompt: English. Para el ancla (escenas 1 y 3): "anchor talking to camera, subtle natural gestures, slight forward lean, eye contact". Para escena 2: descripción del movimiento del evento. Termina con: "{style_seedance_suffix}".
+- audio_script: ESPAÑOL, 18–24 palabras (~6-8s hablados), primera persona del ancla. Escena 3 debe TERMINAR con la frase signature del ancla (o muy cercana).
+- emotion: uno de auto/neutral/happy/sad/angry/fearful/disgusted/surprised/calm/fluent.
+  - Escena 1: típicamente "surprised" o "curious" (auto).
+  - Escena 2: "neutral" o el estado emocional del evento.
+  - Escena 3: "calm" o "neutral" para cerrar con intriga, NUNCA "surprised" otra vez.
+
+DESCRIPCIÓN VISUAL DEL ANCLA (para FLUX en escenas 1 y 3):
+"{anchor_visual}"
+
+SALIDA: JSON estricto. Sin markdown. Sin prefijo. Sin comentarios."""
 
 
-SYSTEM_PROMPT = """Eres un guionista de video viral en español mexicano de calle para el noticiero "VOZ DEL PUEBLO".
-
-VOZ NARRATIVA (sin negociación):
-1. SIEMPRE primera persona ("yo", "veo", "estoy", "siento").
-2. SIEMPRE presente o presente continuo. Cero pasado narrativo.
-3. Drama mexicano callejero, energía Tepito, inspiración Lourdes Ruiz — PERO sin albur sexual, sin doble sentido picante. Drama que VENDE, no telenovela.
-4. Slang chilango bienvenido: "no manches", "ay mi rey/reina", "mira nomás", "ándale", "neta", "pélame", "fíjate", "compa", "cabrón" (light).
-5. Cero clichés news: prohibido "última hora", "en un giro inesperado", "increíble pero cierto", "atención", "alerta máxima", "no vas a creer".
-6. NO inventes datos: solo usas lo que está en el texto fuente. El drama está en CÓMO lo cuentas, no en agregar cosas.
-
-ESTILO VISUAL NOTICIERO (consistente en TODA la salida):
-- Estética documental, periodismo de calle, luz natural mexicana.
-- Composición clásica de reportaje: medium/wide shots, close-ups solo en momentos clave.
-- Sin texto en las imágenes. Sin sobreimpresiones generadas por IA.
-- Paleta cálida, ligeramente desaturada (look "documental").
-
-ESTRUCTURA POR ESCENA:
-- imagen_prompt: English. Base frame for FLUX. Always end with: "documentary photojournalism, broadcast news aesthetic, natural Mexican light, slightly desaturated grade, no text or logos in frame".
-- motion_prompt: English, 1–2 sentences for Seedance. Describes 5-8s motion: slow push-in, subtle handheld feel, pan, dolly. Avoid wild camera moves. Always grounded, news-doc style.
-- audio_script: ESPAÑOL, 18–28 palabras, ~7-9 segundos hablados, primera persona, voz de la persona narrativa elegida. UN gancho fuerte al inicio.
-- emotion: UNO de {"auto", "neutral", "happy", "sad", "angry", "fearful", "surprised", "calm"}. Eliges según el momento dramático: la escena 1 suele querer "surprised" o el tono que enganche; la escena 2 puede ir "neutral" o "calm" para explicar; la escena 3 cierra con la emoción que más venda la historia. Que cambie entre escenas para no sonar monocorde.
-
-VARIACIÓN: cada escena empieza con apertura DISTINTA. Nunca repitas la misma estructura sintáctica entre escenas.
-
-SALIDA: JSON estricto, sin markdown, sin prefijo, sin comentarios."""
-
-
-USER_PROMPT_TEMPLATE = """PERSONA NARRATIVA:
-{persona_voice}
-
-Ejemplos de aperturas de esta persona (NO copies literal, solo guía de tono):
-{opener_examples}
-
-NOTICIA FUENTE:
+USER_PROMPT_TEMPLATE = """NOTICIA FUENTE:
 - Titular: {title}
 - Fuente: {source}
 - Resumen: {snippet}
 - Cuerpo: {body}
 - Región: {region_hits}
 
-Genera el guion en este formato JSON EXACTO:
+Recuerda: el ancla "{anchor_name}" presenta. Escena 1 = ancla hooking. Escena 2 = evento sin ancla. Escena 3 = ancla cerrando con intriga + su frase signature.
+
+JSON exacto:
 
 {{
   "escena_1": {{
-    "imagen_prompt": "<English FLUX prompt, ends with the documentary-news aesthetic clause>",
-    "motion_prompt": "<English Seedance motion, news-doc style, grounded>",
-    "audio_script": "<Spanish, 18-28 palabras, primera persona, gancho fuerte>",
-    "emotion": "<one of auto/neutral/happy/sad/angry/fearful/surprised/calm>"
+    "imagen_prompt": "<English; INCLUDES anchor visual description; ends with style suffix>",
+    "motion_prompt": "<English; talking head behavior; ends with style suffix>",
+    "audio_script": "<Spanish, primera persona del ancla, gancho fuerte, deja pregunta abierta>",
+    "emotion": "<one of auto/neutral/happy/sad/angry/fearful/disgusted/surprised/calm/fluent>"
   }},
   "escena_2": {{
-    "imagen_prompt": "...",
-    "motion_prompt": "...",
-    "audio_script": "...",
+    "imagen_prompt": "<English; the EVENT itself, NO anchor; ends with style suffix>",
+    "motion_prompt": "<English; event motion; ends with style suffix>",
+    "audio_script": "<Spanish, the anchor narrating what we're seeing>",
     "emotion": "..."
   }},
   "escena_3": {{
-    "imagen_prompt": "...",
-    "motion_prompt": "...",
-    "audio_script": "...",
-    "emotion": "..."
+    "imagen_prompt": "<English; anchor again, reacting; ends with style suffix>",
+    "motion_prompt": "<English; anchor closing; ends with style suffix>",
+    "audio_script": "<Spanish; ENDS with the anchor's signature closing line or very close>",
+    "emotion": "<calm or neutral preferred>"
   }}
 }}"""
 
@@ -170,16 +114,15 @@ Genera el guion en este formato JSON EXACTO:
 @dataclass
 class Script:
     news_url: str
-    persona_id: str
+    persona_id: str            # kept as 'persona_id' for log/JSON back-compat; holds anchor.id
+    anchor_id: str
+    anchor_name: str
+    style: str
     scenes: Dict[str, Dict[str, str]]
     model: str
     raw_response: str
 
     def to_prompts_dict(self) -> Dict[str, Dict[str, str]]:
-        """Shape consumed by ReplicateOrchestrator.orchestrate_parallel.
-
-        ReplicateOrchestrator expects per-scene keys with imagen_prompt /
-        audio_script / motion_prompt — passes through unchanged."""
         return self.scenes
 
 
@@ -189,32 +132,47 @@ class ScriptWriter:
         *,
         api_key: Optional[str] = None,
         model: str = "claude-haiku-4-5",
+        style: str = "documentary",
     ):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         if not self.api_key:
             raise RuntimeError("ANTHROPIC_API_KEY not set")
         self.client = Anthropic(api_key=self.api_key)
         self.model = model
+        if style not in STYLE_VARIANTS:
+            raise ValueError(f"Unknown style {style!r}; valid: {list(STYLE_VARIANTS)}")
+        self.style: StyleVariant = STYLE_VARIANTS[style]
 
-    def write(self, item: NewsItem) -> Script:
-        persona = pick_persona(seed=item.url)
+    def write(self, item: NewsItem, anchor: Optional[AnchorCharacter] = None) -> Script:
+        anchor = anchor or anchor_for(f"{item.title}\n{item.snippet}\n{item.body}")
         body = item.body or item.snippet or "(sin cuerpo; usa el titular como única fuente)"
+
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            anchor_name=anchor.name,
+            anchor_voice=anchor.voice_id_hint,
+            anchor_closing=anchor.closing_line,
+            anchor_visual=anchor.visual_description,
+            style_name=self.style.name,
+            style_desc=self.style.description,
+            style_flux_suffix=self.style.flux_suffix,
+            style_seedance_suffix=self.style.seedance_suffix,
+        )
+
         user_prompt = USER_PROMPT_TEMPLATE.format(
-            persona_voice=persona["voice"],
-            opener_examples="\n".join(f"  - {ex}" for ex in persona["opener_examples"]),
             title=item.title,
             source=item.source,
             snippet=item.snippet or "(sin resumen)",
             body=body[:4000],
             region_hits=", ".join(item.region_hits) or "(sin tags)",
+            anchor_name=anchor.name,
         )
 
-        logger.info(f"✍️  Writing script: {item.title[:60]} (persona={persona['id']})")
+        logger.info(f"✍️  Script · anchor={anchor.id} · style={self.style.name} · «{item.title[:60]}»")
 
         msg = self.client.messages.create(
             model=self.model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            max_tokens=1500,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
 
@@ -232,7 +190,10 @@ class ScriptWriter:
 
         return Script(
             news_url=item.url,
-            persona_id=persona["id"],
+            persona_id=anchor.id,
+            anchor_id=anchor.id,
+            anchor_name=anchor.name,
+            style=self.style.name,
             scenes=scenes,
             model=self.model,
             raw_response=text,

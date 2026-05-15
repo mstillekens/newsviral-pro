@@ -2,30 +2,26 @@
 
 Centralizes everything that makes each video feel like the SAME newsroom:
 
-- Color palette (Morena verde + rojo).
-- Standard prompt suffixes appended to FLUX and Seedance per scene, so
-  every shot inherits the documentary-news aesthetic.
-- FFmpeg post-process pipeline applied to the composed video:
-  desaturated/warm grade, lower third with title + source, top-right bug,
-  optional 2s intro/outro card.
+- Anchor characters per news vertical (política/chismes/deportes/clima/local).
+  Each anchor has a name, voice, uniform description, and a list of verticals
+  they cover. The classifier maps a news item → vertical → anchor.
 
-The system fonts on macOS used here are:
-- "Helvetica.ttc" — bold/regular UI font, always present on Darwin.
+- Visual STYLE_VARIANTS (documentary / caricature / comic_book / retro_noir
+  / loonytunes). Selectable per run via --style; baked into FLUX + Seedance
+  prompts via the script writer.
 
-These paths are macOS-specific. On Linux, set BRAND.font_path to a TTF you
-actually have (e.g. /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf).
+- FFmpeg overlay generators for lower-third, bug, Looney-Tunes-style iris
+  intro/outro cards. Falls back gracefully when no usable font is installed.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
-# Default font path. macOS Helvetica is shipped in a TTC (collection); ffmpeg
-# drawtext supports TTCs only with index, so we fall back to the older
-# /System/Library/Fonts/Supplemental/Arial.ttf which is a plain TTF on macOS
-# 13+. If neither is present, branding overlays will silently no-op.
+# ---------- Font detection (macOS) ----------
+
 _MAC_FONT_CANDIDATES = [
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/System/Library/Fonts/Supplemental/Arial.ttf",
@@ -41,106 +37,313 @@ def _detect_font() -> Optional[str]:
     return None
 
 
+# ---------- Brand style ----------
+
 @dataclass
 class BrandStyle:
-    """All of the consistent style for our 'VOZ DEL PUEBLO' brand."""
-
-    # Identity
     newsroom_name: str = "VOZ DEL PUEBLO"
     tagline: str = "Voz del Pueblo · Quintana Roo"
-    primary_hex: str = "235B4E"     # Morena verde
-    accent_hex: str = "9F2241"      # Morena rojo
+    primary_hex: str = "235B4E"
+    accent_hex: str = "9F2241"
     bg_hex: str = "000000"
 
-    # Output format
     width: int = 1920
     height: int = 1080
     fps: int = 30
     bitrate: str = "10M"
 
-    # Prompt suffixes — applied by ScriptWriter via the system prompt; included
-    # here as the canonical source of truth so prompt engineering edits live
-    # next to the visual style.
-    flux_aesthetic_suffix: str = (
-        "documentary photojournalism, broadcast news aesthetic, "
-        "natural Mexican light, slightly desaturated grade, "
-        "no text or logos in frame"
-    )
-    seedance_aesthetic_suffix: str = (
-        "subtle handheld feel, grounded news-documentary style"
-    )
-
-    # Font for overlays (resolved at construction; None means skip overlays)
     font_path: Optional[str] = field(default_factory=_detect_font)
-
-    # Grade — eq= filter values applied to every output.
-    # contrast=1.05 brings up the midtones; saturation=0.85 dials it down 15%;
-    # gamma=0.95 slightly darkens the shadows for a documentary look.
     grade_filter: str = "eq=contrast=1.05:saturation=0.85:gamma=0.95"
 
-    # Intro/outro card durations
     intro_seconds: float = 2.0
     outro_seconds: float = 2.0
 
 
+# ---------- Style variants (visual aesthetic per run) ----------
+
+@dataclass
+class StyleVariant:
+    name: str
+    description: str           # human-readable, shown in CLI help
+    flux_suffix: str           # appended to every FLUX prompt
+    seedance_suffix: str       # appended to every Seedance motion prompt
+
+
+STYLE_VARIANTS: Dict[str, StyleVariant] = {
+    "documentary": StyleVariant(
+        name="documentary",
+        description="Periodismo documental real, look broadcast news, luz natural.",
+        flux_suffix=(
+            "documentary photojournalism, broadcast news aesthetic, "
+            "natural Mexican light, slightly desaturated grade, "
+            "no text or logos in frame"
+        ),
+        seedance_suffix="subtle handheld feel, grounded news-documentary style",
+    ),
+    "caricature": StyleVariant(
+        name="caricature",
+        description="Cartón político mexicano (Helguera/Fisgón), líneas, colores planos.",
+        flux_suffix=(
+            "political cartoon caricature, mexican editorial illustration style, "
+            "bold ink lines, flat saturated colors, exaggerated facial features, "
+            "satirical newspaper aesthetic, no text or speech bubbles in frame, "
+            "2D illustration only"
+        ),
+        seedance_suffix=(
+            "subtle 2D animation: light parallax on background, paper cut-out feel, "
+            "minimal motion, maintain bold ink line style throughout"
+        ),
+    ),
+    "comic_book": StyleVariant(
+        name="comic_book",
+        description="Cómic vintage anos 60, halftone dots, paneles dramáticos.",
+        flux_suffix=(
+            "vintage 1960s comic book illustration, halftone dots, ben-day dots, "
+            "bold panel borders, dramatic shadows, vibrant primary colors, "
+            "comic book aesthetic, no text in frame"
+        ),
+        seedance_suffix="parallax motion on comic panels, slight 2.5D depth, dynamic camera",
+    ),
+    "retro_noir": StyleVariant(
+        name="retro_noir",
+        description="Film noir 1940s, blanco y negro, sombras dramáticas, humo.",
+        flux_suffix=(
+            "film noir 1940s aesthetic, dramatic black and white shadows, "
+            "venetian blinds light pattern, smoke, low-key lighting, "
+            "high contrast, cinematic"
+        ),
+        seedance_suffix="slow dolly through shadows, vintage cinematography, film grain",
+    ),
+    "loonytunes": StyleVariant(
+        name="loonytunes",
+        description="Estilo Looney Tunes clásico — outlines marcados, colores brillantes.",
+        flux_suffix=(
+            "classic 1940s Looney Tunes cartoon style, bold black outlines, "
+            "bright primary colors, exaggerated character expressions, "
+            "slapstick aesthetic, painted watercolor backgrounds, "
+            "no text in frame"
+        ),
+        seedance_suffix=(
+            "classic hand-drawn cartoon animation feel, exaggerated character motion, "
+            "fluid 2D animation style"
+        ),
+    ),
+}
+
+
+# ---------- Anchor characters (one per news vertical) ----------
+
+@dataclass
+class AnchorCharacter:
+    id: str
+    name: str
+    verticals: List[str]           # which news topics this anchor owns
+    voice_id_hint: str             # text describing voice/tone
+    voice_intro: str               # signature opener (used as guidance for Claude)
+    visual_description: str        # FLUX-ready description, includes brand uniform
+    closing_line: str              # signature outro phrase
+    minimax_voice_id: Optional[str] = None  # if user has cloned a voice per anchor
+
+
+# Uniform colors get baked into every visual description so the brand is
+# carried by the character, not just by overlays.
+_UNIFORM_HINT = (
+    "wearing a dark green polo shirt with thin red trim and a small embroidered "
+    "VOZ DEL PUEBLO logo on the chest, casual professional, no other visible text or logos"
+)
+
+
+ANCHORS: List[AnchorCharacter] = [
+    AnchorCharacter(
+        id="don_polibruh",
+        name="Don Polibruh",
+        verticals=["politica", "seguridad"],
+        voice_id_hint=(
+            "Hombre chilango, 40s, ñero, ex-organizador del barrio. Habla con desconfianza "
+            "inteligente, sabe leer entre líneas, frases como 'a ver a ver', 'ojo con esto', "
+            "'aquí entre nos'. No grita, no exclama de más. Va planteando dudas como quien "
+            "está armando el chisme contigo."
+        ),
+        voice_intro="A ver, a ver, escúchame tantito porque esto está sabroso...",
+        visual_description=(
+            f"Mexican man in his early 40s, dark hair with grey on the sides, light beard, "
+            f"square wireframe glasses, a black baseball cap pushed back, "
+            f"{_UNIFORM_HINT}, expressive eyebrows, mid-shot, urban Mexican neighborhood background"
+        ),
+        closing_line="Quédate pendiente, raza, esto apenas comienza.",
+    ),
+    AnchorCharacter(
+        id="dona_chispas",
+        name="Doña Chispas",
+        verticals=["chismes", "espectaculos", "cultura"],
+        voice_id_hint=(
+            "Vecina chilanga del barrio, 55+, sabe todo el tea, lengua larga con cariño. "
+            "Frases tipo 'mi reina', 'fíjate fíjate', 'ay diosito'. Te cuenta el chisme "
+            "como si estuvieras tomando café con ella en el patio."
+        ),
+        voice_intro="Mi reina, no me vas a creer lo que vi ayer en la tarde...",
+        visual_description=(
+            f"Mexican woman in her late 50s, warm smile, dark hair pulled back, "
+            f"silver earrings, a dark green apron with a small VOZ DEL PUEBLO logo "
+            f"and red trim over a floral blouse, holding a small mug of coffee, "
+            f"sunlit Mexican courtyard with clotheslines and potted plants behind her"
+        ),
+        closing_line="Pero todavía falta lo bueno, mi reina. Te cuento luego.",
+    ),
+    AnchorCharacter(
+        id="cuauh_banqueta",
+        name="El Cuauh Banqueta",
+        verticals=["deportes"],
+        voice_id_hint=(
+            "Chavo ñero, 28, ex-llanero, energía alta pero controlada. Frases tipo 'mete-mete', "
+            "'no manches qué jugadón', 'va', 'simón'. Cuenta el deporte como si fuera "
+            "comentarista de cantina."
+        ),
+        voice_intro="A ver, raza, póngale pausa a su chela porque mira nomás...",
+        visual_description=(
+            f"Mexican man in his late 20s, fit build, short black hair with a fade, "
+            f"a sports cap, {_UNIFORM_HINT}, a soccer ball tucked under his arm, "
+            f"a neighborhood futbol cancha with painted walls in the background"
+        ),
+        closing_line="¿Quién va a salir con la cara? Te aviso, banda.",
+    ),
+    AnchorCharacter(
+        id="compa_caribe",
+        name="El Compa Caribe",
+        verticals=["local", "clima", "turismo", "default"],
+        voice_id_hint=(
+            "Joven quintanarroense, 30, mezcla acento chilango+costeño. Frases con sabor: "
+            "'mi loco', 'guapa', 'cero broma'. Casual pero con autoridad de quien vive aquí."
+        ),
+        voice_intro="Mi loco, guapa, ya párenle a lo que están haciendo porque mira nomás...",
+        visual_description=(
+            f"Mexican man in his early 30s, tan skin, dark hair, slight stubble, "
+            f"{_UNIFORM_HINT.replace('polo shirt', 'short-sleeve linen guayabera')}, "
+            f"Caribbean malecón behind him, palm trees, soft golden hour Cancún light"
+        ),
+        closing_line="Aquí seguimos, mi loco. Te platico cuando se ponga más bueno.",
+    ),
+]
+
+
+def _anchor_by_id(aid: str) -> AnchorCharacter:
+    for a in ANCHORS:
+        if a.id == aid:
+            return a
+    return ANCHORS[-1]   # default = compa_caribe
+
+
+# ---------- News vertical classifier ----------
+
+_VERTICAL_KEYWORDS: Dict[str, List[str]] = {
+    "politica": [
+        "amlo", "lopez obrador", "lópez beltrán", "morena", "pri", "pan",
+        "diputado", "senador", "presidente", "gobernador", "alcaldía",
+        "alcalde", "congreso", "elección", "elecciones", "campaña",
+        "gobierno", "partido", "secretario", "funcionario", "borge",
+    ],
+    "seguridad": [
+        "narco", "cartel", "balacera", "homicidio", "asesinato", "detenido",
+        "operativo", "ejército", "violencia", "secuestro", "robo armado",
+    ],
+    "deportes": [
+        "mundial", "fútbol", "futbol", "selección", "liga mx", "gol",
+        "partido", "estadio", "olímpico", "tenis", "boxeo", "uefa",
+    ],
+    "chismes": [
+        "ruptura", "divorcio", "infidelidad", "rumor", "filtrado",
+        "redes sociales", "viral", "tiktok", "instagram", "novia", "novio",
+        "boda", "embarazo",
+    ],
+    "espectaculos": [
+        "concierto", "estreno", "premio", "festival", "película",
+        "serie", "telenovela", "actor", "actriz", "cantante",
+    ],
+    "cultura": [
+        "museo", "exposición", "artista", "literatura", "libro",
+        "escritor", "poeta", "pintor",
+    ],
+    "clima": [
+        "huracán", "tormenta", "lluvia", "frente frío", "calor",
+        "temperatura", "encharcamiento", "marea", "vientos",
+    ],
+    "turismo": [
+        "turista", "turistas", "hotel", "playa", "crucero", "cenote",
+        "arrecife", "snorkel", "buceo",
+    ],
+    "local": [
+        "cancún", "tulum", "playa del carmen", "cozumel", "bacalar",
+        "quintana roo", "isla mujeres", "puerto morelos", "chetumal",
+    ],
+}
+
+
+def classify_vertical(text: str) -> str:
+    """Return the news vertical with the most keyword hits.
+
+    Falls back to 'local' if nothing matches but at least one Quintana Roo
+    region keyword is present (we know it's our turf), otherwise 'default'.
+    """
+    text_lower = (text or "").lower()
+    scores: Dict[str, int] = {}
+    for vertical, keywords in _VERTICAL_KEYWORDS.items():
+        scores[vertical] = sum(1 for kw in keywords if kw in text_lower)
+
+    best = max(scores, key=scores.get)
+    if scores[best] > 0:
+        return best
+    return "default"
+
+
+def anchor_for(text: str) -> AnchorCharacter:
+    """Map a news item's text to its anchor character."""
+    vertical = classify_vertical(text)
+    # First anchor whose verticals list contains the classified vertical.
+    for anchor in ANCHORS:
+        if vertical in anchor.verticals:
+            return anchor
+    # Fallback to the catch-all anchor (must have "default" in their verticals).
+    return next(a for a in ANCHORS if "default" in a.verticals)
+
+
+# ---------- FFmpeg overlay builders ----------
+
 def escape_drawtext_text(s: str) -> str:
-    """Escape characters that have special meaning in ffmpeg drawtext."""
-    # Order matters: backslashes first.
     return (
         s.replace("\\", "\\\\")
          .replace(":", "\\:")
-         .replace("'", "’")     # use unicode right single quote instead
+         .replace("'", "’")
          .replace("%", "\\%")
     )
 
 
-def build_lower_third_filter(
-    style: BrandStyle,
-    title: str,
-    source: str,
-) -> str:
-    """Return an FFmpeg filter chain that draws a lower-third bar + title +
-    source over the input video. No-op when there's no usable font."""
+def build_lower_third_filter(style: BrandStyle, title: str, source: str) -> str:
     if not style.font_path:
         return ""
-
     font = style.font_path
     title_short = title[:75]
     source_short = source[:40]
-    primary = style.primary_hex
     accent = style.accent_hex
 
-    bar_y = "h-130"
-    bar_h = "100"
-    pad_x = "60"
-    title_y = "h-118"
-    source_y = "h-66"
-
-    title_safe = escape_drawtext_text(title_short)
-    source_safe = escape_drawtext_text(source_short)
-
     parts = [
-        f"drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color=0x000000@0.55:t=fill",
-        f"drawbox=x=0:y={bar_y}:w=12:h={bar_h}:color=0x{accent}:t=fill",
-        f"drawtext=fontfile='{font}':text='{title_safe}':x={pad_x}:y={title_y}:"
-        f"fontsize=40:fontcolor=white:line_spacing=4",
-        f"drawtext=fontfile='{font}':text='{source_safe}':x={pad_x}:y={source_y}:"
-        f"fontsize=22:fontcolor=0xCCCCCC",
+        f"drawbox=x=0:y=h-130:w=iw:h=100:color=0x000000@0.55:t=fill",
+        f"drawbox=x=0:y=h-130:w=12:h=100:color=0x{accent}:t=fill",
+        f"drawtext=fontfile='{font}':text='{escape_drawtext_text(title_short)}':"
+        f"x=60:y=h-118:fontsize=40:fontcolor=white:line_spacing=4",
+        f"drawtext=fontfile='{font}':text='{escape_drawtext_text(source_short)}':"
+        f"x=60:y=h-66:fontsize=22:fontcolor=0xCCCCCC",
     ]
     return ",".join(parts)
 
 
 def build_bug_filter(style: BrandStyle) -> str:
-    """Top-right 'VOZ DEL PUEBLO' bug. Compact, branded."""
     if not style.font_path:
         return ""
     font = style.font_path
-    primary = style.primary_hex
-    text = escape_drawtext_text(style.newsroom_name)
     return (
-        f"drawbox=x=w-410:y=40:w=370:h=58:color=0x{primary}@0.85:t=fill,"
-        f"drawtext=fontfile='{font}':text='{text}':x=w-393:y=52:"
-        f"fontsize=32:fontcolor=white"
+        f"drawbox=x=w-410:y=40:w=370:h=58:color=0x{style.primary_hex}@0.85:t=fill,"
+        f"drawtext=fontfile='{font}':text='{escape_drawtext_text(style.newsroom_name)}':"
+        f"x=w-393:y=52:fontsize=32:fontcolor=white"
     )
 
 
@@ -149,45 +352,83 @@ def build_intro_card_cmd(
     output_path: Path,
     title: str,
     source: str,
+    anchor: Optional[AnchorCharacter] = None,
 ) -> list:
-    """Build an ffmpeg command that creates a 2s intro card mp4 matching the
-    main video's format (1920x1080, 30fps, AAC silent track)."""
+    """Looney-Tunes-style iris-out reveal.
+
+    A black background slowly reveals a circular window (red ring border)
+    that grows from the center until it fills the frame. Inside the
+    circle: 'VOZ DEL PUEBLO' in big letters + anchor signature line +
+    news title.
+
+    The iris animation uses the `geq` filter to per-pixel-test whether the
+    pixel is inside a growing circle. Pixels inside the circle keep their
+    color; outside they're forced to black. The radius scales linearly
+    with time T.
+    """
     if not style.font_path:
         return []
-
     font = style.font_path
     primary = style.primary_hex
     accent = style.accent_hex
     name = escape_drawtext_text(style.newsroom_name)
+    anchor_intro = escape_drawtext_text(anchor.voice_intro if anchor else "")
     title_safe = escape_drawtext_text(title[:90])
     source_safe = escape_drawtext_text(source[:50])
 
-    vf = (
-        # Solid background
-        f"drawbox=x=0:y=0:w=iw:h=ih:color=0x000000:t=fill,"
-        # Big newsroom name (centered)
+    dur = style.intro_seconds
+    # max radius covers diagonal so the iris fully reveals.
+    max_r = int((style.width**2 + style.height**2) ** 0.5 / 2) + 20
+
+    # Build the "content" layer first (the colored card with text).
+    content_vf = (
+        # Solid primary background
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=0x{primary}:t=fill,"
+        # Newsroom name big
         f"drawtext=fontfile='{font}':text='{name}':"
-        f"x=(w-text_w)/2:y=(h/2)-90:fontsize=92:fontcolor=white,"
-        # Tagline accent bar
-        f"drawbox=x=(iw/2)-200:y=(h/2)-10:w=400:h=8:color=0x{accent}:t=fill,"
-        # Title
+        f"x=(w-text_w)/2:y=(h/2)-130:fontsize=110:fontcolor=white,"
+        # Accent line
+        f"drawbox=x=(iw/2)-220:y=(h/2)-30:w=440:h=8:color=0x{accent}:t=fill,"
+        # Anchor signature line (small)
+        f"drawtext=fontfile='{font}':text='{anchor_intro}':"
+        f"x=(w-text_w)/2:y=(h/2)+10:fontsize=32:fontcolor=0xFFE9B5,"
+        # Title below
         f"drawtext=fontfile='{font}':text='{title_safe}':"
-        f"x=(w-text_w)/2:y=(h/2)+30:fontsize=46:fontcolor=white,"
+        f"x=(w-text_w)/2:y=(h/2)+80:fontsize=40:fontcolor=white,"
         # Source
         f"drawtext=fontfile='{font}':text='{source_safe}':"
-        f"x=(w-text_w)/2:y=(h/2)+110:fontsize=28:fontcolor=0xCCCCCC"
+        f"x=(w-text_w)/2:y=(h/2)+150:fontsize=24:fontcolor=0xCCCCCC"
     )
 
-    dur = f"{style.intro_seconds:.2f}"
-    # Imported lazily to avoid a circular import (video_compositor imports brand_style).
+    # geq mask: alpha is 255 when inside the growing circle, else 0.
+    # T ranges from 0 to dur. Radius at time T = max_r * (T/dur).
+    geq = (
+        f"format=yuva420p,"
+        f"geq='r=r(X,Y):g=g(X,Y):b=b(X,Y):"
+        f"a=if(lt(hypot(X-W/2,Y-H/2),{max_r}*T/{dur}),255,0)'"
+    )
+
     from video_compositor import FFMPEG_BIN
+
     cmd = [
         FFMPEG_BIN, "-y",
-        "-f", "lavfi", "-t", dur,
-        "-i", f"color=c=0x{style.bg_hex}:s={style.width}x{style.height}:r={style.fps}",
-        "-f", "lavfi", "-t", dur,
+        # Black background, full duration
+        "-f", "lavfi", "-t", f"{dur}",
+        "-i", f"color=c=black:s={style.width}x{style.height}:r={style.fps}",
+        # Content card, also full duration — will be masked to a circle
+        "-f", "lavfi", "-t", f"{dur}",
+        "-i", f"color=c=0x{primary}:s={style.width}x{style.height}:r={style.fps}",
+        # Silent audio
+        "-f", "lavfi", "-t", f"{dur}",
         "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-        "-vf", vf,
+        "-filter_complex",
+        # 1. Apply content_vf to the second input → [content]
+        f"[1:v]{content_vf}[content];"
+        # 2. Mask [content] with the iris circle → [iris]
+        f"[content]{geq}[iris];"
+        # 3. Overlay [iris] onto the black background
+        f"[0:v][iris]overlay=format=auto[v]",
+        "-map", "[v]", "-map", "2:a",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-shortest",
@@ -199,34 +440,53 @@ def build_intro_card_cmd(
 def build_outro_card_cmd(
     style: BrandStyle,
     output_path: Path,
+    anchor: Optional[AnchorCharacter] = None,
 ) -> list:
-    """2s closing card with the brand name centered."""
+    """Iris-in close: an inverse mask — the circle shrinks from full-frame
+    to a point at center, revealing black around it. Inside the circle
+    while it's still visible: anchor closing line + 'VOZ DEL PUEBLO'."""
     if not style.font_path:
         return []
-
     font = style.font_path
-    name = escape_drawtext_text(style.newsroom_name)
-    tag = escape_drawtext_text(style.tagline)
     accent = style.accent_hex
+    primary = style.primary_hex
+    name = escape_drawtext_text(style.newsroom_name)
+    closing = escape_drawtext_text(anchor.closing_line if anchor else "ESO ES TODO, BANDA.")
 
-    vf = (
-        f"drawbox=x=0:y=0:w=iw:h=ih:color=0x000000:t=fill,"
+    dur = style.outro_seconds
+    max_r = int((style.width**2 + style.height**2) ** 0.5 / 2) + 20
+
+    content_vf = (
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=0x{primary}:t=fill,"
+        f"drawtext=fontfile='{font}':text='{closing}':"
+        f"x=(w-text_w)/2:y=(h/2)-80:fontsize=44:fontcolor=white,"
+        f"drawbox=x=(iw/2)-160:y=(h/2)+10:w=320:h=6:color=0x{accent}:t=fill,"
         f"drawtext=fontfile='{font}':text='{name}':"
-        f"x=(w-text_w)/2:y=(h/2)-40:fontsize=110:fontcolor=white,"
-        f"drawbox=x=(iw/2)-180:y=(h/2)+50:w=360:h=6:color=0x{accent}:t=fill,"
-        f"drawtext=fontfile='{font}':text='{tag}':"
-        f"x=(w-text_w)/2:y=(h/2)+80:fontsize=30:fontcolor=0xCCCCCC"
+        f"x=(w-text_w)/2:y=(h/2)+50:fontsize=80:fontcolor=white"
     )
 
-    dur = f"{style.outro_seconds:.2f}"
+    # Inverse iris: circle shrinks from full → 0 over duration.
+    geq = (
+        f"format=yuva420p,"
+        f"geq='r=r(X,Y):g=g(X,Y):b=b(X,Y):"
+        f"a=if(lt(hypot(X-W/2,Y-H/2),{max_r}*(1-T/{dur})),255,0)'"
+    )
+
     from video_compositor import FFMPEG_BIN
+
     cmd = [
         FFMPEG_BIN, "-y",
-        "-f", "lavfi", "-t", dur,
+        "-f", "lavfi", "-t", f"{dur}",
         "-i", f"color=c=black:s={style.width}x{style.height}:r={style.fps}",
-        "-f", "lavfi", "-t", dur,
+        "-f", "lavfi", "-t", f"{dur}",
+        "-i", f"color=c=0x{primary}:s={style.width}x{style.height}:r={style.fps}",
+        "-f", "lavfi", "-t", f"{dur}",
         "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
-        "-vf", vf,
+        "-filter_complex",
+        f"[1:v]{content_vf}[content];"
+        f"[content]{geq}[iris];"
+        f"[0:v][iris]overlay=format=auto[v]",
+        "-map", "[v]", "-map", "2:a",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-shortest",

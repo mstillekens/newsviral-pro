@@ -32,6 +32,7 @@ from news_sources import NewsItem, fetch_google_news, filter_by_date, enrich_wit
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
 from script_writer import Script, ScriptWriter
 from run_logger import RunLogger
+from brand_style import STYLE_VARIANTS, anchor_for
 
 
 # ---------- Logger ----------
@@ -86,6 +87,7 @@ class ConfigPro:
     auto_accept_top: int = 0                # >0: skip CLI, accept top-N automatically
     script_model: str = "claude-haiku-4-5"
     enable_video: bool = True               # True = Seedance image→video; False = stills only
+    style: str = "documentary"              # one of STYLE_VARIANTS keys
 
 
 # ---------- Tareas 1-3: news → script ----------
@@ -192,6 +194,7 @@ async def tarea_2_3_scripts_and_prompts(
     writer = ScriptWriter(
         api_key=config.anthropic_api_key,
         model=config.script_model,
+        style=config.style,
     )
 
     scripts: List[Script] = []
@@ -241,13 +244,16 @@ async def tarea_5_componer_video_pro(
     config: ConfigPro,
     news_title: str = "",
     news_source: str = "",
+    anchor=None,
 ) -> Optional[Dict[str, Any]]:
     """TAREA 5: Compose final video with FFmpeg, with newsroom branding."""
     logger.info("🎬 TAREA 5: Composición Video Final", tiempo=True)
 
     try:
         branding = BrandingConfig(colors=config.colores_morena)
-        compositor = VideoCompositor(branding, news_title=news_title, news_source=news_source)
+        compositor = VideoCompositor(
+            branding, news_title=news_title, news_source=news_source, anchor=anchor
+        )
         composed_video = compositor.compose_with_audio(elementos)
         resultado = compositor.export_mp4(composed_video)
         logger.success(f"Video final: {resultado['video_path']}")
@@ -285,8 +291,12 @@ async def produce_video_for_script(
     if elementos is None:
         return None
 
+    # The anchor is derived from the news item itself, so the intro/outro
+    # iris cards pick up the right signature lines automatically.
+    derived_anchor = anchor_for(f"{news_title}\n{news_source}")
     resultado = await tarea_5_componer_video_pro(
-        elementos, config, news_title=news_title, news_source=news_source
+        elementos, config, news_title=news_title, news_source=news_source,
+        anchor=derived_anchor,
     )
     if resultado is None:
         return None
@@ -402,6 +412,9 @@ def main() -> None:
     p.add_argument("--model", default="claude-haiku-4-5", help="Anthropic model for script writing")
     p.add_argument("--no-video", action="store_true",
                    help="Skip Seedance step (use still images only — ~9x cheaper, lower quality)")
+    p.add_argument("--style", default="documentary",
+                   choices=list(STYLE_VARIANTS.keys()),
+                   help="Visual style variant for FLUX + Seedance prompts")
     args = p.parse_args()
 
     config = ConfigPro(
@@ -413,6 +426,7 @@ def main() -> None:
         auto_accept_top=args.auto,
         script_model=args.model,
         enable_video=not args.no_video,
+        style=args.style,
     )
 
     if not config.anthropic_api_key and not args.mock:

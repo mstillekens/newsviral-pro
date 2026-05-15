@@ -61,7 +61,13 @@ class BrandingConfig:
 class VideoCompositor:
     """Compose video from images and audio using FFmpeg"""
 
-    def __init__(self, config: BrandingConfig = None, news_title: str = "", news_source: str = ""):
+    def __init__(
+        self,
+        config: BrandingConfig = None,
+        news_title: str = "",
+        news_source: str = "",
+        anchor=None,
+    ):
         self.config = config or BrandingConfig(
             colors={
                 "primary": "#235B4E",
@@ -72,6 +78,7 @@ class VideoCompositor:
         self.style: BrandStyle = self.config.to_brand_style()
         self.news_title = news_title or "Noticias QR"
         self.news_source = news_source or self.style.tagline
+        self.anchor = anchor   # AnchorCharacter or None
         self.work_dir = Path("video_work")
         self.output_dir = Path("video_output")
         self.work_dir.mkdir(exist_ok=True)
@@ -163,7 +170,13 @@ class VideoCompositor:
             input_args = ["-i", str(clip)]
             if audio and audio.exists():
                 input_args += ["-i", str(audio)]
-                audio_filter = "[1:a]aresample=48000,apad[aout]"
+                # adelay=300|300 inserts 300ms of silence at the front of the
+                # audio so the narrator never starts mid-syllable at a scene
+                # boundary. apad then extends the audio with silence to fill
+                # the clip's full duration. Combined with `-shortest` below,
+                # output ends at the clip's natural end so we never run past
+                # the visual.
+                audio_filter = "[1:a]aresample=48000,adelay=300|300,apad[aout]"
                 audio_map = ["-map", "[aout]"]
             else:
                 input_args += [
@@ -337,9 +350,12 @@ class VideoCompositor:
             subprocess.run(["cp", input_video, output_video], check=True)
             return output_video
 
-        # 2. Render intro + outro cards.
-        intro_cmd = build_intro_card_cmd(self.style, intro_path, self.news_title, self.news_source)
-        outro_cmd = build_outro_card_cmd(self.style, outro_path)
+        # 2. Render intro + outro cards (Looney-Tunes-style iris in/out,
+        #    customized with the anchor's intro/closing lines when present).
+        intro_cmd = build_intro_card_cmd(
+            self.style, intro_path, self.news_title, self.news_source, anchor=self.anchor
+        )
+        outro_cmd = build_outro_card_cmd(self.style, outro_path, anchor=self.anchor)
         if not intro_cmd or not outro_cmd:
             # If we suddenly can't build cards, just return the graded body.
             logger.warning("Intro/outro skipped; returning graded body only")
