@@ -163,16 +163,24 @@ class ReplicateOrchestrator:
                     logger.info(f"📝 [AUD-{index+1}] Mock audio created: {audio_path}")
                     return str(audio_path)
 
-                # Real Replicate call
+                # Real Replicate call. voice_id is an opaque MiniMax enum
+                # (e.g. "English_Wiselady"). Only pass it if the caller provided
+                # one explicitly via voice_params["voice_id"], otherwise let
+                # MiniMax pick its default. language_boost makes an English
+                # voice speak Spanish text correctly.
+                audio_input = {
+                    "text": script[:3000],
+                    "language_boost": voice_params.get("language_boost", "Spanish"),
+                }
+                vid = voice_params.get("voice_id")
+                if vid:
+                    audio_input["voice_id"] = vid
+
                 output = await asyncio.wait_for(
                     asyncio.to_thread(
                         self.client.run,
-                        "elevenlabs/text-to-speech",
-                        input={
-                            "text": script[:3000],  # ElevenLabs has text limit
-                            "voice": voice_params.get("voice", "adam"),
-                            "model_id": "eleven_monolingual_v1"
-                        }
+                        "minimax/speech-02-hd",
+                        input=audio_input,
                     ),
                     timeout=self.config.timeout_audio_min * 60 + 30
                 )
