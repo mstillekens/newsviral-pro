@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Videos · VOZ DEL PUEBLO{% endblock %}
+{% block content %}
+
+<h1>Videos listos</h1>
+
+{% if not items %}
+  <p class="empty">Todavía no hay videos terminados.<br>
+  Acepta noticias en <a href="/">Noticias</a> y espera a que la <a href="/queue">Cola</a> los produzca.</p>
+{% endif %}
+
+<div class="videos">
+  {% for v in items %}
+  <article class="video">
+    <h2>{{ v.title }}</h2>
+    <p class="meta">{{ v.source }} · Ancla {{ v.anchor or "?" }} · {{ v.finished[:16].replace("T", " ") }}</p>
+    <video controls playsinline preload="metadata" src="/video/{{ v.id }}"></video>
+    <p class="download"><a href="/video/{{ v.id }}" download>Descargar mp4</a></p>
+  </article>
+  {% endfor %}
+</div>
+{% endblock %}

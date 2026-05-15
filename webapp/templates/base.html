@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#235B4E">
+  <title>{% block title %}Voz del Pueblo{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="manifest" href="/static/manifest.json">
+</head>
+<body>
+  <header>
+    <a href="/" class="brand">
+      <span class="brand-bar"></span>
+      <span class="brand-name">VOZ DEL PUEBLO</span>
+    </a>
+    <nav>
+      <a href="/" {% if request.url.path == '/' %}class="active"{% endif %}>Noticias</a>
+      <a href="/queue" {% if request.url.path == '/queue' %}class="active"{% endif %}>Cola</a>
+      <a href="/videos" {% if request.url.path == '/videos' %}class="active"{% endif %}>Videos</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

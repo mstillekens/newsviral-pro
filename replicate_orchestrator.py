@@ -83,29 +83,53 @@ class ReplicateOrchestrator:
 
     # ----- IMAGES (FLUX) -----
 
-    async def _generate_image_url(self, prompt: str, index: int) -> str:
-        """Call FLUX-pro and return the resulting image URL (no local download)."""
+    async def _generate_image_url(
+        self,
+        prompt: str,
+        index: int,
+        reference_image_url: Optional[str] = None,
+    ) -> str:
+        """Generate an image and return its Replicate URL (no local download).
+
+        Two modes:
+        - reference_image_url=None → plain text-to-image via flux-pro.
+        - reference_image_url=<url> → flux-canny-pro takes the URL as
+          control_image. The edges of the reference are preserved while the
+          style is dictated by `prompt`. Used to turn real news photos into
+          on-brand caricatures that still look like the actual subjects.
+        """
+        use_canny = bool(reference_image_url)
+        model = "black-forest-labs/flux-canny-pro" if use_canny else "black-forest-labs/flux-pro"
+
         for attempt in range(self.config.max_retries):
             try:
                 await self.rate_limiter.acquire()
-                logger.info(f"🎨 [IMG-{index+1}] FLUX gen (try {attempt+1}/{self.config.max_retries})")
+                mode = "CANNY+ref" if use_canny else "TXT"
+                logger.info(f"🎨 [IMG-{index+1}] FLUX {mode} (try {attempt+1}/{self.config.max_retries})")
 
                 if self.config.skip_replicate:
                     mock = self.output_dir / f"img_{index+1}_mock.jpg"
                     mock.touch()
                     return f"mock://{mock}"
 
+                if use_canny:
+                    inputs = {
+                        "prompt": prompt[:500],
+                        "control_image": reference_image_url,
+                        "guidance": 30,
+                        "steps": 50,
+                        "output_format": "jpg",
+                    }
+                else:
+                    inputs = {
+                        "prompt": prompt[:500],
+                        "guidance": 3.5,
+                        "num_inference_steps": 50,
+                        "aspect_ratio": self.config.video_aspect_ratio,
+                    }
+
                 output = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.client.run,
-                        "black-forest-labs/flux-pro",
-                        input={
-                            "prompt": prompt[:500],
-                            "guidance": 3.5,
-                            "num_inference_steps": 50,
-                            "aspect_ratio": self.config.video_aspect_ratio,
-                        },
-                    ),
+                    asyncio.to_thread(self.client.run, model, input=inputs),
                     timeout=self.config.timeout_image_min * 60 + 30,
                 )
                 url = str(output)
@@ -120,6 +144,12 @@ class ReplicateOrchestrator:
                     raise
             except Exception as e:
                 logger.error(f"❌ [IMG-{index+1}] {e}")
+                # Canny-specific failures (e.g. unreadable control_image) →
+                # retry once without canny so the pipeline doesn't stall.
+                if use_canny and attempt == self.config.max_retries - 2:
+                    logger.warning(f"⚠️  [IMG-{index+1}] canny failing, falling back to text-only")
+                    use_canny = False
+                    model = "black-forest-labs/flux-pro"
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
@@ -147,10 +177,24 @@ class ReplicateOrchestrator:
         logger.info(f"✅ Images: {len(out)}/{len(prompts)}")
         return out
 
-    async def generate_image_url_batch(self, prompts: List[str]) -> Dict[str, str]:
-        """Parallel FLUX gen returning URLs only. Used as input to Seedance."""
+    async def generate_image_url_batch(
+        self,
+        prompts: List[str],
+        reference_image_urls: Optional[List[Optional[str]]] = None,
+    ) -> Dict[str, str]:
+        """Parallel FLUX gen returning URLs only. Used as input to Seedance.
+
+        reference_image_urls[i] is an optional URL to pass to flux-canny-pro
+        for scene i+1 (preserves edges of source image, applies style from
+        prompt). None → text-only flux-pro for that scene.
+        """
         logger.info(f"📷 Image URL batch: {len(prompts)} prompts")
-        tasks = [self._generate_image_url(p, i) for i, p in enumerate(prompts)]
+        if reference_image_urls is None:
+            reference_image_urls = [None] * len(prompts)
+        tasks = [
+            self._generate_image_url(p, i, reference_image_urls[i] if i < len(reference_image_urls) else None)
+            for i, p in enumerate(prompts)
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: Dict[str, str] = {}
         for i, r in enumerate(results):
@@ -374,6 +418,7 @@ class ReplicateOrchestrator:
         motion_prompts = [v.get("motion_prompt", "") for _, v in scene_entries]
         audio_scripts = [v.get("audio_script", "") for _, v in scene_entries]
         emotions = [v.get("emotion", "auto") for _, v in scene_entries]
+        reference_image_urls = [v.get("reference_image_url") for _, v in scene_entries]
         voice_params = prompts.get("voice_params", {}) if isinstance(prompts.get("voice_params"), dict) else {}
 
         if not image_prompts or not audio_scripts:
@@ -385,8 +430,8 @@ class ReplicateOrchestrator:
         )
 
         if self.config.enable_video:
-            # FLUX URLs → Seedance → local mp4
-            image_urls = await self.generate_image_url_batch(image_prompts)
+            # FLUX URLs (text-only or img2img with ref) → Seedance → local mp4
+            image_urls = await self.generate_image_url_batch(image_prompts, reference_image_urls)
             videos = await self.generate_video_batch(image_urls, motion_prompts)
             images: Dict[str, str] = {}  # not needed; compositor uses videos
         else:

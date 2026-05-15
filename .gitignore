@@ -78,3 +78,6 @@ score_weights.json
 
 # Node modules (if needed)
 node_modules/
+
+# Webapp state
+webapp/state.json

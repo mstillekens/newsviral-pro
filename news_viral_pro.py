@@ -29,6 +29,7 @@ from web_dashboard import ProgressTracker
 from replicate_orchestrator import ReplicateOrchestrator, ReplicateConfig
 from video_compositor import VideoCompositor, BrandingConfig
 from news_sources import NewsItem, fetch_google_news, filter_by_date, enrich_with_body
+from news_image_finder import find_reference_image
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
 from script_writer import Script, ScriptWriter
 from run_logger import RunLogger
@@ -279,6 +280,19 @@ async def produce_video_for_script(
     logger.info(f"━━━ Video #{idx}: «{news_title[:70]}» (persona={script.persona_id}) ━━━")
 
     prompts = script.to_prompts_dict()
+
+    # Reference image enrichment for scene 2 (the "event" scene per our
+    # template). If we can scrape an og:image from the news URL we pass it
+    # as control_image to flux-canny-pro, which preserves the source's
+    # composition while applying the style prompt — so caricatures look
+    # like the actual subjects.
+    # We deliberately attach the ref image only to scene 2; scenes 1 and 3
+    # show the anchor and don't benefit from outside imagery.
+    if "escena_2" in prompts and script.news_url:
+        ref = await asyncio.to_thread(find_reference_image, script.news_url)
+        if ref:
+            prompts["escena_2"]["reference_image_url"] = ref.url
+            logger.info(f"📸 ref-image escena_2: {ref.source} → {ref.url[:80]}")
 
     # Inject voice_params from env so the orchestrator passes the trained
     # chilango voice (if any) to MiniMax. The orchestrator iterates only over

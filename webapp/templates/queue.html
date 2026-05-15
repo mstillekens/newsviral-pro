@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Cola · VOZ DEL PUEBLO{% endblock %}
+{% block content %}
+
+<h1>Cola de generación</h1>
+<p class="hint">Los videos tardan ~3 min cada uno. Esta página se refresca sola cada 5 s.</p>
+
+{% if not jobs %}
+  <p class="empty">Aún no has aceptado ninguna noticia.<br>
+  Ve a <a href="/">Noticias</a> y toca ✓ Generar en alguna.</p>
+{% endif %}
+
+<ul class="jobs" id="jobs-list">
+{% for j in jobs %}
+  <li class="job status-{{ j.status }}" data-id="{{ j.id }}">
+    <div class="job-head">
+      <span class="badge {{ j.status }}">{{ j.status }}</span>
+      <span class="job-time">{{ j.created[:16].replace("T", " ") }}</span>
+    </div>
+    <h3>{{ j.title }}</h3>
+    <p class="job-source">{{ j.source }}</p>
+    {% if j.status == "done" %}
+      <p class="job-anchor">Ancla: <strong>{{ j.anchor or "?" }}</strong></p>
+      <a class="watch" href="/video/{{ j.id }}">▶ Ver video</a>
+    {% elif j.status == "failed" %}
+      <p class="job-error">{{ j.error }}</p>
+    {% else %}
+      <p class="job-status">{% if j.status == "running" %}Generando…{% else %}En espera…{% endif %}</p>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+
+<script>
+// Lightweight polling: hit /api/queue every 5s and re-render the list if
+// anything moved. Keeps the page reactive without WebSockets.
+async function refresh() {
+  try {
+    const r = await fetch('/api/queue');
+    if (!r.ok) return;
+    const jobs = await r.json();
+    const ul = document.getElementById('jobs-list');
+    if (!ul) return;
+    const fresh = jobs.map(j => renderJob(j)).join('');
+    if (ul.innerHTML.trim() !== fresh.trim()) {
+      ul.innerHTML = fresh;
+    }
+  } catch (e) { /* network blip, ignore */ }
+}
+
+function renderJob(j) {
+  const time = (j.created || '').slice(0, 16).replace('T', ' ');
+  const anchor = j.anchor ? `<p class="job-anchor">Ancla: <strong>${escapeHtml(j.anchor)}</strong></p>` : '';
+  let body = '';
+  if (j.status === 'done') {
+    body = `${anchor}<a class="watch" href="/video/${j.id}">▶ Ver video</a>`;
+  } else if (j.status === 'failed') {
+    body = `<p class="job-error">${escapeHtml(j.error || 'error')}</p>`;
+  } else {
+    body = `<p class="job-status">${j.status === 'running' ? 'Generando…' : 'En espera…'}</p>`;
+  }
+  return `<li class="job status-${j.status}" data-id="${j.id}">
+    <div class="job-head">
+      <span class="badge ${j.status}">${j.status}</span>
+      <span class="job-time">${time}</span>
+    </div>
+    <h3>${escapeHtml(j.title)}</h3>
+    <p class="job-source">${escapeHtml(j.source)}</p>
+    ${body}
+  </li>`;
+}
+
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+setInterval(refresh, 5000);
+</script>
+{% endblock %}

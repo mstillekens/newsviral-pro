@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Noticias · VOZ DEL PUEBLO{% endblock %}
+{% block content %}
+
+<section class="stats">
+  <div><strong>{{ pending|length }}</strong><span>por decidir</span></div>
+  <div><strong>{{ decided }}</strong><span>decididas</span></div>
+  <div><strong>{{ queue_size }}</strong><span>en cola</span></div>
+  <div><strong>{{ videos_ready }}</strong><span>videos listos</span></div>
+</section>
+
+<form action="/refresh" method="post" class="refresh">
+  <button type="submit">↻ Refrescar noticias QR</button>
+</form>
+
+{% if not pending %}
+  <p class="empty">No hay noticias pendientes.<br>Refresca arriba para traer las del día.</p>
+{% endif %}
+
+<div class="cards">
+  {% for item in pending %}
+  <article class="card">
+    <header class="card-head">
+      <span class="score">score {{ "%.2f"|format(item.score) }}</span>
+      <span class="source">{{ item.source }}</span>
+    </header>
+    <h2>{{ item.title }}</h2>
+    <p class="snippet">{{ item.snippet[:240] }}</p>
+    {% if item.region_hits %}
+      <p class="regions">
+        {% for r in item.region_hits %}<span>{{ r }}</span>{% endfor %}
+      </p>
+    {% endif %}
+    <p class="published">{{ item.published_at[:16].replace("T", " ") }}</p>
+    <form action="/decide" method="post" class="decide">
+      <input type="hidden" name="url" value="{{ item.url }}">
+      <button type="submit" name="accept" value="no" class="no">✕ Pasar</button>
+      <button type="submit" name="accept" value="yes" class="yes">✓ Generar</button>
+    </form>
+  </article>
+  {% endfor %}
+</div>
+
+{% endblock %}
