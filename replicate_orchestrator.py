@@ -25,6 +25,8 @@ from typing import Dict, List, Optional
 import aiohttp
 import replicate
 
+from spend_logger import record as record_spend
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -168,6 +170,7 @@ class ReplicateOrchestrator:
                     timeout=self.config.timeout_image_min * 60 + 30,
                 )
                 url = str(output)
+                record_spend(model, scene=f"escena_{index+1}")
                 logger.info(f"✅ [IMG-{index+1}] URL: {url[:80]}")
                 return url
 
@@ -300,6 +303,7 @@ class ReplicateOrchestrator:
                     timeout=self.config.timeout_video_min * 60 + 60,
                 )
                 url = str(output)
+                record_spend(self.config.video_model, scene=f"escena_{index+1}")
                 logger.info(f"✅ [VID-{index+1}] mp4 URL ready")
                 local = await self._download_file(url, f"video_{index+1}.mp4")
                 return str(local)
@@ -366,6 +370,7 @@ class ReplicateOrchestrator:
                     timeout=self.config.timeout_lip_sync_min * 60 + 30,
                 )
                 url = str(output)
+                record_spend(self.config.lip_sync_model, scene=f"lipsync_{index+1}")
                 logger.info(f"✅ [LIPSYNC-{index+1}] mp4 URL ready")
                 local = await self._download_file(url, f"lipsync_{index+1}.mp4")
                 return str(local)
@@ -468,6 +473,7 @@ class ReplicateOrchestrator:
                         timeout=self.config.timeout_lip_sync_min * 60 + 30,
                     )
                 url = str(output)
+                record_spend(self.config.lip_sync_model, scene=f"lipsync_{index+1}")
                 logger.info(f"✅ [LIPSYNC-{index+1}] mp4 URL ready")
                 local = await self._download_file(url, f"lipsync_{index+1}.mp4")
                 return str(local)
@@ -585,6 +591,7 @@ class ReplicateOrchestrator:
                     ),
                     timeout=self.config.timeout_audio_min * 60 + 30,
                 )
+                record_spend("minimax/speech-02-hd", scene=f"escena_{index+1}")
                 local = await self._download_file(output, f"audio_{index+1}.mp3")
                 logger.info(f"✅ [AUD-{index+1}] {local}")
                 return str(local)
