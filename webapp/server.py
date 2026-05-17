@@ -52,6 +52,13 @@ from replicate_orchestrator import ReplicateConfig, ReplicateOrchestrator
 from video_compositor import BrandingConfig, VideoCompositor
 from run_logger import RunLogger
 from brand_style import STYLE_VARIANTS, ANCHORS, anchor_for, pick_voice_id_for
+from news_enrichment import (
+    aggregate_news_clusters,
+    NewsCluster,
+    NewsEnrichmentSystem,
+    EnrichmentConfig,
+    EnrichmentError,
+)
 
 
 logging.basicConfig(
@@ -63,18 +70,47 @@ logger = logging.getLogger("webapp")
 
 # ---------- Env ----------
 
-def _load_env(path: Path = ROOT / ".env") -> None:
-    if not path.exists():
+def _find_env_file(start: Path) -> Optional[Path]:
+    """Walk upward from `start` looking for a `.env`.
+
+    Git worktrees don't inherit `.env` (it's gitignored), but the main repo
+    has it. This finds it whether we run from the main repo or any worktree.
+    """
+    for d in [start, *start.parents]:
+        candidate = d / ".env"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_env(path: Optional[Path] = None) -> None:
+    env_path = path or _find_env_file(ROOT)
+    if env_path is None:
         return
-    for line in path.read_text().splitlines():
+    for line in env_path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, _, v = line.partition("=")
         if not os.environ.get(k.strip()):
             os.environ[k.strip()] = v.strip()
+    logger.info(f"📒 Loaded env from {env_path}")
+
 
 _load_env()
+
+
+# Health check: warn loudly if the keys video generation needs are missing.
+# We don't refuse to start (the dashboard, refresh, and queue views still work
+# without them) — but every Generar click will fail, so the user should know.
+_MISSING_KEYS = [k for k in ("ANTHROPIC_API_KEY", "REPLICATE_API_TOKEN")
+                 if not os.environ.get(k)]
+if _MISSING_KEYS:
+    logger.warning(
+        f"⚠️  Missing env vars: {', '.join(_MISSING_KEYS)} — "
+        f"'Generar' will fail until these are set. "
+        f"Add them to {ROOT}/.env or the parent repo .env"
+    )
 
 
 # ---------- State (one user, no DB needed) ----------
@@ -156,12 +192,26 @@ def _inject_anchor_portrait_for(prompts: Dict[str, Any], anchor_id: str) -> None
 
 
 async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
-    """Run script → Replicate → compose for one news item."""
+    """Run enrichment → script → Replicate → compose for one news item.
+
+    Stage updates write to s["jobs"][job_id]["stage"] for live UI display:
+      "enriching" → "scripting" → "rendering" → "composing" → "done"|"failed"
+    """
     item = NewsItem(**{k: v for k, v in item_dict.items() if k in NewsItem.__dataclass_fields__})
+
+    def _set_stage(stage: str, **extra) -> None:
+        def _mut(s):
+            j = s["jobs"].get(job_id) or {}
+            j["stage"] = stage
+            for k, v in extra.items():
+                j[k] = v
+            s["jobs"][job_id] = j
+        update_state(_mut)
 
     def mark_started(s):
         s["jobs"][job_id]["status"] = "running"
         s["jobs"][job_id]["started"] = datetime.now().isoformat()
+        s["jobs"][job_id]["stage"] = "enriching"
     update_state(mark_started)
 
     # Per-job options — read at job dispatch time so the user can change them
@@ -176,21 +226,57 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
 
     async with GEN_LOCK:
         try:
-            anchor = anchor_for(f"{item.title}\n{item.snippet}\n{item.body}")
             writer = ScriptWriter(model="claude-haiku-4-5", style=style_name)
+
+            # Deep enrichment: 7+ sources, fact-check, brief, real images.
+            # Runs BEFORE script_writer so the brief + verified facts feed the
+            # prompt. Reuses the writer's Anthropic client.
+            enricher = NewsEnrichmentSystem(
+                writer.client,
+                logger,
+                config=EnrichmentConfig(quality_threshold=70),
+            )
+            try:
+                enriched = await enricher.enrich(item)
+                _set_stage("scripting",
+                           enrichment_score=enriched.quality_score,
+                           sources_count=len(enriched.sources),
+                           facts_count=len(enriched.facts),
+                           images_count=len(enriched.images),
+                           passed=enriched.passed)
+                if enriched.brief:
+                    item.body = enriched.brief
+                item.verified_facts = [f.text for f in enriched.facts]
+                item.source_refs = [s.url for s in enriched.sources]
+                item.enriched_quality_score = enriched.quality_score
+                item.selected_image_urls = list(enriched.selected_image_urls)
+            except EnrichmentError as e:
+                logger.warning(f"Enrichment failed for job {job_id}: {e} (continuing)")
+                _set_stage("scripting", enrichment_error=str(e))
+
+            anchor = anchor_for(f"{item.title}\n{item.snippet}\n{item.body}")
             script = await asyncio.to_thread(writer.write, item, anchor)
+            _set_stage("rendering")
 
             prompts = dict(script.scenes)
             # Anchor portrait → scenes 1 and 3 (kept consistent across runs).
             _inject_anchor_portrait_for(prompts, anchor.id)
 
-            # ref-image enrichment for scene 2
-            if "escena_2" in prompts and item.url:
-                ref = await asyncio.to_thread(
-                    find_reference_image_with_fallback, item.url, item.title,
-                )
-                if ref:
-                    prompts["escena_2"]["reference_image_url"] = ref.url
+            # ref-image for escena_2: prefer enrichment-picked image (when
+            # the LLM scored it best from 8+ scraped), else fall back to the
+            # DuckDuckGo-augmented og:image scraper from main.
+            if "escena_2" in prompts:
+                selected = list(getattr(item, "selected_image_urls", None) or [])
+                if selected:
+                    chosen = selected[1] if len(selected) > 1 else selected[0]
+                    prompts["escena_2"]["reference_image_url"] = chosen
+                    logger.info(f"📸 ref-image escena_2 (enriched): {chosen[:80]}")
+                elif item.url:
+                    ref = await asyncio.to_thread(
+                        find_reference_image_with_fallback, item.url, item.title,
+                    )
+                    if ref:
+                        prompts["escena_2"]["reference_image_url"] = ref.url
 
             # Gender-matched voice (with optional cloned override).
             voice_id = pick_voice_id_for(anchor, dict(os.environ))
@@ -205,6 +291,7 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
             elementos = await orch.orchestrate_parallel(prompts)
             if not await orch.validate_outputs(elementos):
                 raise RuntimeError("validate_outputs failed")
+            _set_stage("composing")
 
             compositor = VideoCompositor(
                 BrandingConfig(
@@ -231,6 +318,7 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
 
             def mark_done(s):
                 s["jobs"][job_id]["status"] = "done"
+                s["jobs"][job_id]["stage"] = "done"
                 s["jobs"][job_id]["video_path"] = str(archived)
                 s["jobs"][job_id]["anchor"] = anchor.name
                 s["jobs"][job_id]["finished"] = datetime.now().isoformat()
@@ -240,6 +328,7 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
             logger.exception(f"Job {job_id} failed")
             def mark_fail(s):
                 s["jobs"][job_id]["status"] = "failed"
+                s["jobs"][job_id]["stage"] = "failed"
                 s["jobs"][job_id]["error"] = str(e)
                 s["jobs"][job_id]["finished"] = datetime.now().isoformat()
             update_state(mark_fail)
@@ -356,32 +445,124 @@ async def update_settings(
     return RedirectResponse(url="/", status_code=303)
 
 
+# Simple OR query — Google News RSS handles this fine; extra_queries below
+# add a second angle without exploding into N HTTP calls.
+QR_QUERY = "Cancun OR \"Quintana Roo\" OR \"Riviera Maya\" OR Tulum"
+
+
 @app.post("/refresh", response_class=RedirectResponse)
 async def refresh(_: None = Depends(require_auth)):
-    """Refetch RSS + score, replace current_run."""
-    items = await asyncio.to_thread(
-        fetch_google_news, since_days=2, max_items=30, require_region_hit=True
-    )
+    """Multi-source aggregator: Google News + Reddit + intl RSS, clustered
+    by similar title so one card = one story across many outlets.
+
+    Falls back to legacy single-source RSS if the aggregator returns nothing
+    (network blip, all sources down) — the UI never goes empty as long as
+    Google News works.
+    """
+    clusters: List[NewsCluster] = []
+    try:
+        clusters = await aggregate_news_clusters(
+            QR_QUERY,
+            extra_queries=["Cancún noticias"],
+            intl_rss=False,        # regional QR news isn't in BBC/Reuters
+            reddit=False,          # Reddit subs in English rarely cover QR news
+            timeout_total=10.0,
+            jaccard_threshold=0.30,  # regional titles vary; be tolerant
+        )
+    except Exception as e:
+        logger.warning(f"aggregator failed, falling back to RSS: {e}")
+
     weights = load_weights()
-    scored = score_items(items, weights)[:15]
+    items_for_scoring: List[NewsItem] = []
+    cluster_by_url: Dict[str, NewsCluster] = {}
+
+    if clusters:
+        for c in clusters:
+            primary = c.primary
+            item = NewsItem(
+                title=primary.title,
+                url=primary.url,
+                source=primary.outlet.split(":", 1)[-1] if ":" in primary.outlet else primary.outlet,
+                published_at=primary.published_at or datetime.now().isoformat(),
+                snippet=primary.snippet,
+                body="",
+                region_hits=[],
+            )
+            items_for_scoring.append(item)
+            cluster_by_url[item.url] = c
+    else:
+        # Fallback: original single-source pipeline.
+        legacy = await asyncio.to_thread(
+            fetch_google_news, since_days=2, max_items=30, require_region_hit=True
+        )
+        items_for_scoring = legacy
+
+    scored = score_items(items_for_scoring, weights)
+
+    # Source-count boost: stories covered by ≥2 outlets get a confidence bump.
+    # +0.05 per extra source (capped at +0.20). Consensus = reliability.
+    for s in scored:
+        c = cluster_by_url.get(s.item.url)
+        if c and c.source_count >= 2:
+            boost = min(0.20, 0.05 * (c.source_count - 1))
+            s.score = min(1.0, s.score + boost)
+            s.breakdown["multi_source"] = round(boost, 3)
+
+    # M1 hard filter: drop anything below 60/100 — these don't make the cut.
+    MIN_SCORE = 60
+    scored = [s for s in scored if int(round(s.score * 100)) >= MIN_SCORE]
+
+    # Sort: score desc, then date desc (newest of the tied scores first).
+    scored.sort(
+        key=lambda x: (x.score, x.item.published_at or ""),
+        reverse=True,
+    )
+    scored = scored[:15]
+
+    def _tier(score_int: int) -> str:
+        if score_int >= 85:
+            return "featured"   # gold/red, top editorial
+        if score_int >= 70:
+            return "good"       # amber
+        return "regular"        # grey
+
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     def mut(state):
         state["current_run"] = run_id
-        state["news_by_run"][run_id] = [
-            {
+        rows = []
+        for s in scored:
+            c = cluster_by_url.get(s.item.url)
+            source_count = c.source_count if c else 1
+            score_int = int(round(s.score * 100))
+            rows.append({
                 "url": s.item.url,
                 "title": s.item.title,
                 "source": s.item.source,
                 "published_at": s.item.published_at,
                 "snippet": s.item.snippet,
                 "region_hits": s.item.region_hits,
-                "score": s.score,
+                "score": s.score,                 # float, kept for back-compat
+                "score_int": score_int,           # 0-100 integer for UI
+                "tier": _tier(score_int),         # regular | good | featured
+                "unconfirmed": source_count < 2,  # single-source exclusive
                 "breakdown": s.breakdown,
-            }
-            for s in scored
-        ]
+                "source_count": source_count,
+                "alternate_sources": [
+                    {"url": m.url, "outlet": m.outlet, "title": m.title}
+                    for m in (c.members[1:6] if c else [])
+                ],
+                "credibility": (round(c.credibility, 3) if c else None),
+            })
+        state["news_by_run"][run_id] = rows
     update_state(mut)
+
+    crossed = sum(1 for s in scored
+                  if cluster_by_url.get(s.item.url) and cluster_by_url[s.item.url].source_count >= 2)
+    logger.info(
+        f"/refresh: {len(scored)} stories after MIN_SCORE={MIN_SCORE} filter, "
+        f"{crossed} cross-verified (≥2 sources)"
+    )
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -402,6 +583,22 @@ async def decide(
             break
     if not item_data:
         raise HTTPException(404, "Item not found in current run")
+
+    # Pre-flight: if the user is asking us to spend money/tokens, make sure
+    # we have the keys to do so. Fail with a useful message instead of
+    # queueing a job that's guaranteed to crash.
+    if accepted:
+        missing = [k for k in ("ANTHROPIC_API_KEY", "REPLICATE_API_TOKEN")
+                   if not os.environ.get(k)]
+        if missing:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Falta configurar: {', '.join(missing)}. "
+                    f"Agrega las keys en {ROOT}/.env (o en el .env del repo padre) "
+                    f"y reinicia el server."
+                ),
+            )
 
     def mut(s):
         s["decisions"][url] = accepted

@@ -49,10 +49,24 @@
 
 <div class="cards">
   {% for item in pending %}
-  <article class="card">
+  {# Back-compat: old runs may not have score_int / tier yet. #}
+  {% set score_int = item.score_int if item.score_int is defined else (item.score * 100)|int %}
+  {% set tier = item.tier if item.tier is defined else ('featured' if score_int >= 85 else ('good' if score_int >= 70 else 'regular')) %}
+  {% set src_count = item.source_count or 1 %}
+  {% set unconfirmed = item.unconfirmed if item.unconfirmed is defined else (src_count < 2) %}
+  <article class="card tier-{{ tier }}">
     <header class="card-head">
-      <span class="score">score {{ "%.2f"|format(item.score) }}</span>
+      <span class="score tier-{{ tier }}" title="Score editorial 0-100">{{ score_int }}</span>
       <span class="source">{{ item.source }}</span>
+      {% if unconfirmed %}
+        <span class="badge unconfirmed" title="Sólo una fuente cubre esta noticia">Sin confirmar</span>
+      {% elif src_count >= 3 %}
+        <span class="badge verified" title="Cubierta por {{ src_count }} medios distintos">
+          ✓ {{ src_count }} fuentes
+        </span>
+      {% elif src_count == 2 %}
+        <span class="badge multi" title="Cubierta por 2 medios">{{ src_count }} fuentes</span>
+      {% endif %}
     </header>
     <h2>{{ item.title }}</h2>
     <p class="snippet">{{ item.snippet[:240] }}</p>
@@ -60,6 +74,16 @@
       <p class="regions">
         {% for r in item.region_hits %}<span>{{ r }}</span>{% endfor %}
       </p>
+    {% endif %}
+    {% if item.alternate_sources %}
+      <details class="alt-sources">
+        <summary>Ver otras fuentes ({{ item.alternate_sources|length }})</summary>
+        <ul>
+          {% for alt in item.alternate_sources %}
+            <li><a href="{{ alt.url }}" target="_blank" rel="noopener">{{ alt.outlet }}</a> — {{ alt.title[:100] }}</li>
+          {% endfor %}
+        </ul>
+      </details>
     {% endif %}
     <p class="published">{{ item.published_at[:16].replace("T", " ") }}</p>
     <form action="/decide" method="post" class="decide">
