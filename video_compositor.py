@@ -171,16 +171,17 @@ class VideoCompositor:
             if audio and audio.exists():
                 input_args += ["-i", str(audio)]
                 # Build per-scene audio chain:
-                #   1. aresample 48k:          harmonize sample rate
-                #   2. afade out (last 400ms): keeps MiniMax's last syllable
+                #   1. aresample 48k:          harmonize sample rate.
+                #   2. loudnorm I=-16 LUFS:    EBU R128 broadcast standard.
+                #      MiniMax varies its output level scene-to-scene; without
+                #      this, one clip plays at -22 LUFS and the next at -10
+                #      and the audience feels the volume jump. Single-pass
+                #      loudnorm is imperfect but consistent enough that the
+                #      perceptual jumps go away.
+                #   3. afade out (last 400ms): keeps MiniMax's last syllable
                 #      from ending in a hard click before silence padding.
-                #      We probe duration so the fade fires at the right
-                #      moment regardless of how long the narrator went on.
-                #   3. adelay 300ms:           300ms breath at scene start so
-                #      the cut from previous scene's tail isn't mid-syllable.
-                #   4. apad:                   extend with silence to fill
-                #      the clip's full duration (–shortest at output keeps
-                #      it from running past the visual).
+                #   4. adelay 300ms:           300ms breath at scene start.
+                #   5. apad:                   silence to fill clip duration.
                 #
                 # We do the fade BEFORE adelay so the duration math is in the
                 # original audio's timeline.
@@ -188,6 +189,7 @@ class VideoCompositor:
                 fade_start = max(0.1, audio_dur - 0.4)
                 audio_filter = (
                     "[1:a]aresample=48000,"
+                    "loudnorm=I=-16:TP=-1.5:LRA=11,"
                     f"afade=t=out:st={fade_start:.3f}:d=0.4,"
                     "adelay=300|300,apad[aout]"
                 )
