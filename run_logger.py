@@ -48,6 +48,21 @@ class RunLogger:
     def scripts(self, scripts: List[Any]) -> Path:
         return self._write("04_scripts.json", scripts)
 
+    def log_event(self, kind: str, payload: Dict[str, Any]) -> None:
+        """Append a structured event to events.jsonl."""
+        entry = {"kind": kind, "ts": datetime.now().isoformat(), **payload}
+        self._append_jsonl("events.jsonl", entry)
+
+    def save_artifact(self, rel_path: str, payload: Any) -> Path:
+        """Save an arbitrary JSON-serializable artifact under self.dir/<rel_path>."""
+        path = self.dir / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(payload, (dict, list)):
+            path.write_text(json.dumps(_to_json(payload), indent=2, ensure_ascii=False))
+        else:
+            path.write_text(str(payload))
+        return path
+
     def video(self, item_index: int, news_title: str, video_result: Dict[str, Any], src_video: Path) -> Path:
         """Record a single video result and copy the mp4 into the run dir."""
         target = self.dir / f"video_{item_index:02d}.mp4"

@@ -35,6 +35,12 @@ from news_scorer import ScoredItem, load_weights, save_weights, score_items, upd
 from script_writer import Script, ScriptWriter
 from run_logger import RunLogger
 from brand_style import STYLE_VARIANTS, anchor_for, pick_voice_id_for
+from news_enrichment import (
+    NewsEnrichmentSystem,
+    EnrichmentConfig,
+    EnrichedNews,
+    EnrichmentError,
+)
 
 
 # Lazy-load the anchor portrait manifest. The orchestrator can skip FLUX
@@ -133,6 +139,10 @@ class ConfigPro:
     style: str = "documentary"              # one of STYLE_VARIANTS keys
     enable_lip_sync: bool = False           # Wav2Lip on anchor scenes (~+$0.10/video)
     vertical: bool = False                  # 9:16 1080×1920 (Reels/TikTok/cel)
+    # Enrichment controls
+    enable_enrichment: bool = True
+    strict_enrichment: bool = False         # if True, skip items that fail validation
+    enrichment_threshold: int = 70          # 0-100, score below this = failed
 
 
 # ---------- Tareas 1-3: news → script ----------
@@ -221,18 +231,22 @@ async def tarea_2_3_scripts_and_prompts(
     accepted: List[NewsItem],
     config: ConfigPro,
     run_log: RunLogger,
-) -> List[Script]:
-    """TAREAS 2+3 merged: enrich each accepted item with its full body (Sipse
-    scraper) when possible, then call Claude to write the 3-scene script.
-    The script already contains imagen_prompt + audio_script per scene, so
-    there's no separate tarea_3."""
+) -> Tuple[List[Script], List[NewsItem]]:
+    """TAREAS 2+3 merged: enrich each accepted item with full body, run the
+    NewsEnrichmentSystem (7+ sources, fact-checked, brief + 3 scenes +
+    8 real images, quality validated), then call Claude/ScriptWriter to
+    generate the 3-scene script with verified facts injected.
+
+    Returns (scripts, items) so the caller has the post-enrichment items
+    (with selected_image_urls populated) aligned 1:1 with scripts.
+    """
     if not accepted:
-        return []
+        return [], []
 
     logger.info("✍️  TAREA 2-3: Scripts + Prompts (Claude)", tiempo=True)
 
-    # Scrape full bodies in parallel.
-    enriched = await asyncio.gather(*[
+    # Scrape full bodies in parallel (Sipse path; rest is left for the enricher).
+    bodied = await asyncio.gather(*[
         asyncio.to_thread(enrich_with_body, item) for item in accepted
     ])
 
@@ -242,17 +256,90 @@ async def tarea_2_3_scripts_and_prompts(
         style=config.style,
     )
 
+    enricher: Optional[NewsEnrichmentSystem] = None
+    if config.enable_enrichment:
+        enricher = NewsEnrichmentSystem(
+            writer.client,
+            logger,
+            config=EnrichmentConfig(
+                quality_threshold=config.enrichment_threshold,
+                model=config.script_model,
+            ),
+        )
+        logger.info(
+            f"🧪 Enrichment ON (threshold={config.enrichment_threshold}, "
+            f"strict={config.strict_enrichment})"
+        )
+    else:
+        logger.info("🧪 Enrichment OFF (--no-enrich)")
+
     scripts: List[Script] = []
-    for item in enriched:
+    final_items: List[NewsItem] = []
+    for idx, item in enumerate(bodied):
+        if enricher is not None:
+            try:
+                enriched = await enricher.enrich(item)
+                run_log.log_event("news_enriched", {
+                    "idx": idx,
+                    "title": item.title[:120],
+                    "quality_score": enriched.quality_score,
+                    "passed": enriched.passed,
+                    "sources": len(enriched.sources),
+                    "facts": len(enriched.facts),
+                    "images": len(enriched.images),
+                    "timings_ms": enriched.timings_ms,
+                    "errors": enriched.errors,
+                })
+                run_log.save_artifact(
+                    f"news_{idx:02d}/enriched.json", enriched.to_dict()
+                )
+
+                if not enriched.passed:
+                    logger.warning(
+                        f"⚠️  Enrichment {enriched.quality_score}/100 (threshold "
+                        f"{config.enrichment_threshold}). Errors: {enriched.errors}"
+                    )
+                    if config.strict_enrichment:
+                        logger.warning(f"   strict mode → skip «{item.title[:60]}»")
+                        continue
+
+                # Inject enrichment into the item so ScriptWriter uses it
+                if enriched.brief:
+                    item.body = enriched.brief
+                item.verified_facts = [f.text for f in enriched.facts]
+                item.source_refs = [s.url for s in enriched.sources]
+                item.enriched_quality_score = enriched.quality_score
+                item.selected_image_urls = list(enriched.selected_image_urls)
+                # Stash derived scenes for ScriptWriter narration override.
+                item._enriched_scenes = dict(enriched.scenes)  # type: ignore[attr-defined]
+            except EnrichmentError as e:
+                logger.error(f"Enrichment crashed for «{item.title[:60]}»: {e}")
+                run_log.log_event("news_enriched", {
+                    "idx": idx, "title": item.title[:120],
+                    "crashed": str(e),
+                })
+                if config.strict_enrichment:
+                    continue
+                # else: continue with the un-enriched item
+
         try:
             script = await asyncio.to_thread(writer.write, item)
+            # If enrichment produced derived scenes, override the narrations
+            # while keeping ScriptWriter's imagen/motion/emotion fields intact.
+            derived = getattr(item, "_enriched_scenes", None)
+            if isinstance(derived, dict):
+                for k in ("escena_1", "escena_2", "escena_3"):
+                    txt = derived.get(k)
+                    if txt and k in script.scenes:
+                        script.scenes[k]["audio_script"] = txt
             scripts.append(script)
+            final_items.append(item)
         except Exception as e:
             logger.error(f"Script failed for «{item.title[:60]}»: {e}")
 
     run_log.scripts(scripts)
     logger.success(f"{len(scripts)} guiones generados")
-    return scripts
+    return scripts, final_items
 
 
 # ---------- Tareas 4-5 (unchanged from Phase 2) ----------
@@ -320,6 +407,7 @@ async def produce_video_for_script(
     run_log: RunLogger,
     mock: bool,
     news_source: str = "",
+    item: Optional[NewsItem] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run TAREA 4 + 5 for one news item's script, copy the resulting mp4 into
     the per-run log dir, and return the result metadata."""
@@ -339,13 +427,23 @@ async def produce_video_for_script(
     # like the actual subjects.
     # We deliberately attach the ref image only to scene 2; scenes 1 and 3
     # show the anchor and don't benefit from outside imagery.
-    if "escena_2" in prompts and script.news_url:
-        ref = await asyncio.to_thread(
-            find_reference_image_with_fallback, script.news_url, news_title,
-        )
-        if ref:
-            prompts["escena_2"]["reference_image_url"] = ref.url
-            logger.info(f"📸 ref-image escena_2: {ref.source} → {ref.url[:80]}")
+    if "escena_2" in prompts:
+        # Prefer the LLM-selected image from NewsEnrichmentSystem when the
+        # caller passed a fully-enriched item; otherwise fall back to the
+        # DuckDuckGo-augmented og:image scraper.
+        selected_urls = list(getattr(item, "selected_image_urls", []) or []) if item else []
+        if selected_urls:
+            # Enrichment chose 3 images; #2 = the event scene.
+            chosen = selected_urls[1] if len(selected_urls) > 1 else selected_urls[0]
+            prompts["escena_2"]["reference_image_url"] = chosen
+            logger.info(f"📸 ref-image escena_2 (enriched): {chosen[:80]}")
+        elif script.news_url:
+            ref = await asyncio.to_thread(
+                find_reference_image_with_fallback, script.news_url, news_title,
+            )
+            if ref:
+                prompts["escena_2"]["reference_image_url"] = ref.url
+                logger.info(f"📸 ref-image escena_2: {ref.source} → {ref.url[:80]}")
 
     # Pick a gender-matched MiniMax voice for this anchor. Priority chain:
     # per-anchor env var → global env var → anchor's hard-coded default.
@@ -417,17 +515,20 @@ async def run(config: ConfigPro, mock: bool) -> int:
         logger.info("Ninguna noticia aceptada. Nada que generar.")
         return 0
 
-    # 4. Scripts + prompts via Claude
+    # 4. Scripts + prompts via Claude (with enrichment if enabled)
     tracker.start("scripts")
-    scripts = await tarea_2_3_scripts_and_prompts(accepted_items, config, run_log)
+    scripts, final_items = await tarea_2_3_scripts_and_prompts(
+        accepted_items, config, run_log
+    )
     tracker.done("scripts", message=f"{len(scripts)} scripts")
 
     # 5. Per-script: Replicate + FFmpeg
     tracker.start("videos")
     produced: List[Dict[str, Any]] = []
-    for idx, (item, script) in enumerate(zip(accepted_items[: len(scripts)], scripts), start=1):
+    for idx, (item, script) in enumerate(zip(final_items, scripts), start=1):
         result = await produce_video_for_script(
-            idx, script, item.title, config, run_log, mock, news_source=item.source
+            idx, script, item.title, config, run_log, mock,
+            news_source=item.source, item=item,
         )
         if result:
             produced.append(result)
@@ -487,6 +588,12 @@ def main() -> None:
                    help="Apply Wav2Lip to anchor scenes (~+\$0.10/video). Off by default.")
     p.add_argument("--vertical", action="store_true",
                    help="Render at 1080×1920 (9:16) for Reels/TikTok/celular en lugar de 1920×1080.")
+    p.add_argument("--no-enrich", action="store_true",
+                   help="Disable NewsEnrichmentSystem (legacy single-source mode).")
+    p.add_argument("--strict-enrich", action="store_true",
+                   help="Skip items that fail enrichment quality threshold.")
+    p.add_argument("--enrich-threshold", type=int, default=70,
+                   help="Quality score 0-100 below which enrichment is 'failed' (default 70).")
     args = p.parse_args()
 
     config = ConfigPro(
@@ -501,6 +608,9 @@ def main() -> None:
         style=args.style,
         enable_lip_sync=args.lipsync,
         vertical=args.vertical,
+        enable_enrichment=not args.no_enrich,
+        strict_enrichment=args.strict_enrich,
+        enrichment_threshold=args.enrich_threshold,
     )
 
     if not config.anthropic_api_key and not args.mock:

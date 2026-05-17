@@ -84,7 +84,7 @@ USER_PROMPT_TEMPLATE = """NOTICIA FUENTE:
 - Resumen: {snippet}
 - Cuerpo: {body}
 - Región: {region_hits}
-
+{enrichment_block}
 Recuerda: el ancla "{anchor_name}" presenta. Escena 1 = ancla hooking. Escena 2 = evento sin ancla. Escena 3 = ancla cerrando con intriga + su frase signature.
 
 JSON exacto:
@@ -158,6 +158,19 @@ class ScriptWriter:
             style_seedance_suffix=self.style.seedance_suffix,
         )
 
+        enrichment_block = ""
+        verified = getattr(item, "verified_facts", None) or []
+        refs = getattr(item, "source_refs", None) or []
+        if verified or refs:
+            facts_lines = "\n".join(f"- {f}" for f in verified[:12]) or "(sin)"
+            refs_lines = "\n".join(f"- {u}" for u in refs[:10]) or "(sin)"
+            enrichment_block = (
+                "\nHECHOS VERIFICADOS (úsalos como base; NO inventes nada fuera de aquí):\n"
+                f"{facts_lines}\n\n"
+                "FUENTES CRUZADAS:\n"
+                f"{refs_lines}\n"
+            )
+
         user_prompt = USER_PROMPT_TEMPLATE.format(
             title=item.title,
             source=item.source,
@@ -165,6 +178,7 @@ class ScriptWriter:
             body=body[:4000],
             region_hits=", ".join(item.region_hits) or "(sin tags)",
             anchor_name=anchor.name,
+            enrichment_block=enrichment_block,
         )
 
         logger.info(f"✍️  Script · anchor={anchor.id} · style={self.style.name} · «{item.title[:60]}»")

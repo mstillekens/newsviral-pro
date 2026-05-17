@@ -44,6 +44,11 @@ class NewsItem:
     snippet: str = ""         # short summary from RSS
     body: str = ""            # full article body (populated by scraper)
     region_hits: List[str] = field(default_factory=list)
+    # Populated by NewsEnrichmentSystem when the item passes through it.
+    verified_facts: List[str] = field(default_factory=list)
+    source_refs: List[str] = field(default_factory=list)
+    enriched_quality_score: Optional[int] = None
+    selected_image_urls: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
