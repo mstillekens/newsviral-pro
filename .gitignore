@@ -96,3 +96,6 @@ webapp/state.json
 # Agent caches (local IDE/CLI state, not project code)
 .claude/
 .superpowers/
+news.db
+tests/test.db
+*.db-journal

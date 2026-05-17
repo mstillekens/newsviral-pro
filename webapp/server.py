@@ -44,7 +44,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from news_sources import NewsItem, fetch_google_news, enrich_with_body
+from news_sources import (
+    NewsItem, fetch_google_news, enrich_with_body,
+    SourceRegistry, fetch_all_rss_sources,
+)
+from news_db import NewsDB, ArticleRecord
+from deduplicator import Deduplicator
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
 from news_image_finder import find_reference_image_with_fallback
 from script_writer import (
@@ -448,6 +453,29 @@ def require_auth(request: Request) -> None:
 
 # ---------- App ----------
 
+# Lazy singletons for the news engine (M2-M5). Created on first /refresh
+# so import-time isn't blocked by I/O and tests can swap them.
+_SOURCE_REGISTRY: Optional[SourceRegistry] = None
+_NEWS_DB: Optional[NewsDB] = None
+
+
+def _get_source_registry() -> SourceRegistry:
+    global _SOURCE_REGISTRY
+    if _SOURCE_REGISTRY is None:
+        _SOURCE_REGISTRY = SourceRegistry.from_file(
+            str(ROOT / "source_registry.json")
+        )
+    return _SOURCE_REGISTRY
+
+
+def _get_news_db() -> NewsDB:
+    global _NEWS_DB
+    if _NEWS_DB is None:
+        _NEWS_DB = NewsDB(str(ROOT / "news.db"))
+        _NEWS_DB.init_schema()
+    return _NEWS_DB
+
+
 app = FastAPI(title="VOZ DEL PUEBLO")
 templates = Jinja2Templates(directory=str(ROOT / "webapp" / "templates"))
 app.mount("/static", StaticFiles(directory=str(ROOT / "webapp" / "static")), name="static")
@@ -533,15 +561,39 @@ async def refresh(_: None = Depends(require_auth)):
     (network blip, all sources down) — the UI never goes empty as long as
     Google News works.
     """
+    # M2-M5 NEW SOURCE: poll the SourceRegistry's active RSS feeds. This is
+    # the primary, broader path — 50+ publishers + cross-run dedup via
+    # NewsDB. Falls back to the legacy aggregator on failure.
+    registry_items: List[NewsItem] = []
+    try:
+        registry = _get_source_registry()
+        active = registry.active_rss_sources()
+        registry_items = await asyncio.to_thread(
+            fetch_all_rss_sources, active, since_days=3, max_per_source=30,
+            max_total=400,
+        )
+        # Cross-run dedup against DB: skip URLs we've already shown.
+        db = _get_news_db()
+        before = len(registry_items)
+        registry_items = [i for i in registry_items if not db.is_known_url(i.url_hash)]
+        logger.info(
+            f"registry fetch: {len(registry_items)}/{before} fresh items "
+            f"from {len(active)} sources (cross-run dedup removed {before - len(registry_items)})"
+        )
+    except Exception as e:
+        logger.warning(f"registry fetch failed: {e}")
+
+    # ALSO run the existing aggregator (Google News + clusters) — it
+    # gives us multi-source clustering which the registry feeds don't.
     clusters: List[NewsCluster] = []
     try:
         clusters = await aggregate_news_clusters(
             QR_QUERY,
             extra_queries=["Cancún noticias"],
-            intl_rss=False,        # regional QR news isn't in BBC/Reuters
-            reddit=False,          # Reddit subs in English rarely cover QR news
+            intl_rss=False,
+            reddit=False,
             timeout_total=10.0,
-            jaccard_threshold=0.30,  # regional titles vary; be tolerant
+            jaccard_threshold=0.30,
         )
     except Exception as e:
         logger.warning(f"aggregator failed, falling back to RSS: {e}")
@@ -550,6 +602,8 @@ async def refresh(_: None = Depends(require_auth)):
     items_for_scoring: List[NewsItem] = []
     cluster_by_url: Dict[str, NewsCluster] = {}
 
+    # Merge: cluster items + registry items, deduped in-session.
+    dedup = Deduplicator()
     if clusters:
         for c in clusters:
             primary = c.primary
@@ -562,14 +616,25 @@ async def refresh(_: None = Depends(require_auth)):
                 body="",
                 region_hits=[],
             )
+            if dedup.is_new(item):
+                items_for_scoring.append(item)
+                cluster_by_url[item.url] = c
+
+    for item in registry_items:
+        if dedup.is_new(item):
             items_for_scoring.append(item)
-            cluster_by_url[item.url] = c
-    else:
-        # Fallback: original single-source pipeline.
+
+    if not items_for_scoring:
+        # Last-resort fallback: legacy single-source pipeline.
         legacy = await asyncio.to_thread(
-            fetch_google_news, since_days=2, max_items=30, require_region_hit=True
+            fetch_google_news, since_days=3, max_items=200, require_region_hit=False,
         )
         items_for_scoring = legacy
+
+    logger.info(
+        f"/refresh source mix: clusters={len(cluster_by_url)} "
+        f"registry={len(registry_items)} total_pre_score={len(items_for_scoring)}"
+    )
 
     scored = score_items(items_for_scoring, weights)
 
@@ -631,6 +696,33 @@ async def refresh(_: None = Depends(require_auth)):
         state["news_by_run"][run_id] = rows
     update_state(mut)
 
+    # Persist the top N to NewsDB so future /refresh cross-run dedups
+    # them out. We persist after MIN_SCORE filter — we don't want the DB
+    # bloated with low-quality items, but we DO want shown items to be
+    # remembered so refreshes don't repeat them.
+    try:
+        db = _get_news_db()
+        records = [
+            ArticleRecord(
+                url=s.item.url, url_hash=s.item.url_hash,
+                title=s.item.title, source=s.item.source,
+                published_at=s.item.published_at,
+                detected_at=s.item.detected_at or datetime.now().isoformat(),
+                snippet=s.item.snippet or "",
+                body=s.item.body or "",
+                category="",
+                source_region=getattr(s.item, "source_region", "") or "",
+                author=getattr(s.item, "author", "") or "",
+                image_url=getattr(s.item, "image_url", "") or "",
+                score=float(s.score),
+            )
+            for s in scored
+        ]
+        landed = db.insert_articles(records)
+        logger.info(f"/refresh persisted {landed} new articles to DB")
+    except Exception as e:
+        logger.warning(f"DB persist failed (non-fatal): {e}")
+
     crossed = sum(1 for s in scored
                   if cluster_by_url.get(s.item.url) and cluster_by_url[s.item.url].source_count >= 2)
     logger.info(
@@ -638,6 +730,16 @@ async def refresh(_: None = Depends(require_auth)):
         f"{crossed} cross-verified (≥2 sources)"
     )
     return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/api/news-engine-stats")
+async def news_engine_stats(_: None = Depends(require_auth)):
+    """Quick stats from NewsDB — articles seen, sources, recent errors."""
+    try:
+        db = _get_news_db()
+        return JSONResponse(db.stats())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.post("/decide")
