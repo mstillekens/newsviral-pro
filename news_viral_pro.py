@@ -30,7 +30,7 @@ from web_dashboard import ProgressTracker
 from replicate_orchestrator import ReplicateOrchestrator, ReplicateConfig
 from video_compositor import VideoCompositor, BrandingConfig
 from news_sources import NewsItem, fetch_google_news, filter_by_date, enrich_with_body
-from news_image_finder import find_reference_image
+from news_image_finder import find_reference_image_with_fallback
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
 from script_writer import Script, ScriptWriter
 from run_logger import RunLogger
@@ -340,7 +340,9 @@ async def produce_video_for_script(
     # We deliberately attach the ref image only to scene 2; scenes 1 and 3
     # show the anchor and don't benefit from outside imagery.
     if "escena_2" in prompts and script.news_url:
-        ref = await asyncio.to_thread(find_reference_image, script.news_url)
+        ref = await asyncio.to_thread(
+            find_reference_image_with_fallback, script.news_url, news_title,
+        )
         if ref:
             prompts["escena_2"]["reference_image_url"] = ref.url
             logger.info(f"📸 ref-image escena_2: {ref.source} → {ref.url[:80]}")

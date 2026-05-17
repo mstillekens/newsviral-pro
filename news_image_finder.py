@@ -121,3 +121,24 @@ def _safe_int(value) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def find_reference_image_with_fallback(
+    article_url: str, headline: str
+) -> Optional[ReferenceImage]:
+    """Try the og:image scraper first, then fall back to DDG image search.
+
+    DDG fallback only fires when scraping returned None — usually because
+    the article URL was paywalled, missing og:image meta, or had no <img>
+    bigger than the thumbnail threshold."""
+    from image_search import search_news_image
+
+    primary = find_reference_image(article_url)
+    if primary:
+        return primary
+    if not headline:
+        return None
+    url = search_news_image(headline)
+    if not url:
+        return None
+    return ReferenceImage(url=url, source="ddg-image-search", article_url=article_url)

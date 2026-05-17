@@ -46,7 +46,7 @@ from fastapi.templating import Jinja2Templates
 
 from news_sources import NewsItem, fetch_google_news, enrich_with_body
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
-from news_image_finder import find_reference_image
+from news_image_finder import find_reference_image_with_fallback
 from script_writer import ScriptWriter
 from replicate_orchestrator import ReplicateConfig, ReplicateOrchestrator
 from video_compositor import BrandingConfig, VideoCompositor
@@ -186,7 +186,9 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
 
             # ref-image enrichment for scene 2
             if "escena_2" in prompts and item.url:
-                ref = await asyncio.to_thread(find_reference_image, item.url)
+                ref = await asyncio.to_thread(
+                    find_reference_image_with_fallback, item.url, item.title,
+                )
                 if ref:
                     prompts["escena_2"]["reference_image_url"] = ref.url
 
