@@ -69,6 +69,13 @@ replicate_outputs/
 video_work/
 video_output/
 
+# Exception: anchor portraits are brand assets we DO commit so every
+# deployment shares the same canonical anchor characters.
+!anchor_portraits/
+!anchor_portraits/*.jpg
+!anchor_portraits/*.png
+!anchor_portraits/manifest.json
+
 # Logs
 *.log
 logs/
