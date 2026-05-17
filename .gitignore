@@ -92,3 +92,7 @@ node_modules/
 
 # Webapp state
 webapp/state.json
+
+# Agent caches (local IDE/CLI state, not project code)
+.claude/
+.superpowers/
