@@ -76,6 +76,10 @@ video_output/
 !anchor_portraits/*.png
 !anchor_portraits/manifest.json
 
+# Exception: brand assets (logo etc) are committed.
+!assets/
+!assets/*.png
+
 # Logs
 *.log
 logs/
