@@ -503,3 +503,50 @@ async def video_file(job_id: str):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.get("/admin/spend", response_class=HTMLResponse)
+async def admin_spend(request: Request, _: None = Depends(require_auth)):
+    """Last-14-day Replicate spend, aggregated per day.
+
+    No CSS bells — this is for the operator, not the public. The webapp's
+    main / view already gives the polished mobile UI."""
+    from spend_logger import summary
+
+    days = 14
+    data = summary(days=days)
+    sorted_days = sorted(data.keys(), reverse=True)
+    total = sum(d["total_usd"] for d in data.values())
+    total_calls = sum(d["call_count"] for d in data.values())
+
+    rows = "".join(
+        f'<tr><td>{day}</td>'
+        f'<td style="text-align:right">${data[day]["total_usd"]:.2f}</td>'
+        f'<td style="text-align:right">{data[day]["call_count"]}</td></tr>'
+        for day in sorted_days
+    )
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Spend · VOZ DEL PUEBLO</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; padding: 24px; max-width: 600px; margin: 0 auto; background: #F6F4EE; color: #1A1A1A; }}
+h1 {{ font-size: 22px; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 16px; background: white; border-radius: 12px; overflow: hidden; }}
+th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid rgba(0,0,0,0.06); }}
+th {{ background: #2D5A4E; color: white; }}
+.total {{ font-weight: bold; background: rgba(159,34,65,0.08); }}
+.note {{ color: #666; font-size: 12px; margin-top: 16px; }}
+a {{ color: #2D5A4E; }}
+</style></head><body>
+<h1>Replicate spend (last {days} days)</h1>
+<table>
+  <tr><th>Día</th><th style="text-align:right">USD</th><th style="text-align:right">Llamadas</th></tr>
+  {rows or '<tr><td colspan="3" style="text-align:center;color:#999">Sin datos aún</td></tr>'}
+  <tr class="total"><td>TOTAL</td>
+    <td style="text-align:right">${total:.2f}</td>
+    <td style="text-align:right">{total_calls}</td></tr>
+</table>
+<p class="note">Costos estimados a partir de COST_PER_CALL en spend_logger.py.
+Para precios reales en tu cuenta, revisa <a href="https://replicate.com/account/billing">replicate.com/account/billing</a>.</p>
+<p><a href="/">← Volver</a></p>
+</body></html>"""
+    return HTMLResponse(html)
