@@ -48,14 +48,18 @@ class BrandingConfig:
     watermark_text: str = "VOZ DEL PUEBLO"
     watermark_position: str = "bottom-right"
     watermark_opacity: float = 0.7
+    vertical: bool = False    # True → 9:16 1080×1920 output for Reels/TikTok/cel
 
     def to_brand_style(self) -> BrandStyle:
-        return BrandStyle(
+        kwargs = dict(
             newsroom_name=self.watermark_text,
             primary_hex=self.colors.get("primary", "235B4E").lstrip("#"),
             accent_hex=self.colors.get("accent", "9F2241").lstrip("#"),
             bg_hex=self.colors.get("bg", "000000").lstrip("#"),
         )
+        if self.vertical:
+            return BrandStyle.vertical(**kwargs)
+        return BrandStyle(**kwargs)
 
 
 class VideoCompositor:
@@ -204,8 +208,8 @@ class VideoCompositor:
 
             cmd = [FFMPEG_BIN, "-y"] + input_args + [
                 "-filter_complex",
-                "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
-                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[vout];"
+                f"[0:v]scale={self.style.width}:{self.style.height}:force_original_aspect_ratio=decrease,"
+                f"pad={self.style.width}:{self.style.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={self.style.fps}[vout];"
                 + audio_filter,
                 "-map", "[vout]",
                 *audio_map,
@@ -279,8 +283,8 @@ class VideoCompositor:
             v_in = idx * 2
             a_in = idx * 2 + 1
             filter_parts.append(
-                f"[{v_in}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
-                f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{idx}]"
+                f"[{v_in}:v]scale={self.style.width}:{self.style.height}:force_original_aspect_ratio=decrease,"
+                f"pad={self.style.width}:{self.style.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={self.style.fps}[v{idx}]"
             )
             concat_inputs.append(f"[v{idx}][{a_in}:a]")
         filter_parts.append(
@@ -434,9 +438,12 @@ class VideoCompositor:
             return audio_path
 
     def export_mp4(self, video_path: str,
-                   bitrate: str = "10M",
-                   resolution: str = "1920x1080") -> Dict:
-        """Export final MP4 video"""
+                   bitrate: Optional[str] = None,
+                   resolution: Optional[str] = None) -> Dict:
+        """Export final MP4 video. Defaults pulled from the active BrandStyle
+        so a 9:16 vertical pipeline exports at 1080×1920 (not 1920×1080)."""
+        bitrate = bitrate or self.style.bitrate
+        resolution = resolution or f"{self.style.width}x{self.style.height}"
         logger.info(f"📤 Exporting MP4...")
         logger.info(f"   Resolution: {resolution}")
         logger.info(f"   Bitrate: {bitrate}")

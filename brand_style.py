@@ -47,6 +47,8 @@ class BrandStyle:
     accent_hex: str = "9F2241"
     bg_hex: str = "000000"
 
+    # Output dimensions. Default is 16:9 horizontal (broadcast). Use
+    # BrandStyle.vertical() to get a 9:16 instance for Reels/TikTok/cel.
     width: int = 1920
     height: int = 1080
     fps: int = 30
@@ -57,6 +59,22 @@ class BrandStyle:
 
     intro_seconds: float = 2.0
     outro_seconds: float = 2.0
+
+    @property
+    def is_vertical(self) -> bool:
+        """True when the canvas is taller than wide. Drives layout decisions
+        like lower-third height, bug size, and font scale."""
+        return self.height > self.width
+
+    @property
+    def aspect_ratio_str(self) -> str:
+        """The aspect ratio Replicate's FLUX + Seedance expect as input."""
+        return "9:16" if self.is_vertical else "16:9"
+
+    @classmethod
+    def vertical(cls, **overrides) -> "BrandStyle":
+        """Construct a 9:16 (Reels/TikTok/cel) brand style."""
+        return cls(width=1080, height=1920, **overrides)
 
 
 # ---------- Style variants (visual aesthetic per run) ----------
@@ -353,17 +371,45 @@ def build_lower_third_filter(style: BrandStyle, title: str, source: str) -> str:
     if not style.font_path:
         return ""
     font = style.font_path
-    title_short = title[:75]
-    source_short = source[:40]
     accent = style.accent_hex
 
+    # Vertical canvases are TALL — the lower-third needs more height to be
+    # readable on a phone held vertically, and bigger fonts because the
+    # viewer's distance is short. Horizontal canvases are for TV/desktop
+    # viewing → keep the slim, broadcast-style chyron.
+    if style.is_vertical:
+        bar_h = 180
+        bar_y = "h-260"
+        accent_w = 14
+        pad_x = 50
+        title_y = "h-245"
+        source_y = "h-160"
+        title_fs = 56
+        source_fs = 32
+        title_max = 50
+        source_max = 32
+    else:
+        bar_h = 100
+        bar_y = "h-130"
+        accent_w = 12
+        pad_x = 60
+        title_y = "h-118"
+        source_y = "h-66"
+        title_fs = 40
+        source_fs = 22
+        title_max = 75
+        source_max = 40
+
+    title_short = title[:title_max]
+    source_short = source[:source_max]
+
     parts = [
-        f"drawbox=x=0:y=h-130:w=iw:h=100:color=0x000000@0.55:t=fill",
-        f"drawbox=x=0:y=h-130:w=12:h=100:color=0x{accent}:t=fill",
+        f"drawbox=x=0:y={bar_y}:w=iw:h={bar_h}:color=0x000000@0.55:t=fill",
+        f"drawbox=x=0:y={bar_y}:w={accent_w}:h={bar_h}:color=0x{accent}:t=fill",
         f"drawtext=fontfile='{font}':text='{escape_drawtext_text(title_short)}':"
-        f"x=60:y=h-118:fontsize=40:fontcolor=white:line_spacing=4",
+        f"x={pad_x}:y={title_y}:fontsize={title_fs}:fontcolor=white:line_spacing=4",
         f"drawtext=fontfile='{font}':text='{escape_drawtext_text(source_short)}':"
-        f"x=60:y=h-66:fontsize=22:fontcolor=0xCCCCCC",
+        f"x={pad_x}:y={source_y}:fontsize={source_fs}:fontcolor=0xCCCCCC",
     ]
     return ",".join(parts)
 
@@ -372,10 +418,29 @@ def build_bug_filter(style: BrandStyle) -> str:
     if not style.font_path:
         return ""
     font = style.font_path
+    # Vertical: smaller bug (less width to spare), nudged in from top-right.
+    if style.is_vertical:
+        bug_w = 240
+        bug_h = 50
+        bug_x_off = 270   # right edge offset
+        bug_y = 60
+        text_x_off = 256
+        text_y = 70
+        text_fs = 26
+    else:
+        bug_w = 370
+        bug_h = 58
+        bug_x_off = 410
+        bug_y = 40
+        text_x_off = 393
+        text_y = 52
+        text_fs = 32
+
     return (
-        f"drawbox=x=w-410:y=40:w=370:h=58:color=0x{style.primary_hex}@0.85:t=fill,"
+        f"drawbox=x=w-{bug_x_off}:y={bug_y}:w={bug_w}:h={bug_h}:"
+        f"color=0x{style.primary_hex}@0.85:t=fill,"
         f"drawtext=fontfile='{font}':text='{escape_drawtext_text(style.newsroom_name)}':"
-        f"x=w-393:y=52:fontsize=32:fontcolor=white"
+        f"x=w-{text_x_off}:y={text_y}:fontsize={text_fs}:fontcolor=white"
     )
 
 
@@ -413,23 +478,50 @@ def build_intro_card_cmd(
     max_r = int((style.width**2 + style.height**2) ** 0.5 / 2) + 20
 
     # Build the "content" layer first (the colored card with text).
+    # Vertical card has more breathing room top→bottom, so we spread the
+    # text further apart and make 'VOZ DEL PUEBLO' larger relative to width
+    # (a 1080-wide canvas at fontsize=140 is ~70% of width — gigante).
+    if style.is_vertical:
+        name_fs = 90
+        name_y = "(h/2)-300"
+        accent_y = "(h/2)-180"
+        accent_w_px = 360
+        intro_fs = 38
+        intro_y = "(h/2)-100"
+        title_fs = 56
+        title_y = "(h/2)+0"
+        source_fs = 32
+        source_y = "(h/2)+200"
+    else:
+        name_fs = 110
+        name_y = "(h/2)-130"
+        accent_y = "(h/2)-30"
+        accent_w_px = 440
+        intro_fs = 32
+        intro_y = "(h/2)+10"
+        title_fs = 40
+        title_y = "(h/2)+80"
+        source_fs = 24
+        source_y = "(h/2)+150"
+
     content_vf = (
         # Solid primary background
         f"drawbox=x=0:y=0:w=iw:h=ih:color=0x{primary}:t=fill,"
         # Newsroom name big
         f"drawtext=fontfile='{font}':text='{name}':"
-        f"x=(w-text_w)/2:y=(h/2)-130:fontsize=110:fontcolor=white,"
+        f"x=(w-text_w)/2:y={name_y}:fontsize={name_fs}:fontcolor=white,"
         # Accent line
-        f"drawbox=x=(iw/2)-220:y=(h/2)-30:w=440:h=8:color=0x{accent}:t=fill,"
+        f"drawbox=x=(iw/2)-{accent_w_px//2}:y={accent_y}:w={accent_w_px}:h=8:"
+        f"color=0x{accent}:t=fill,"
         # Anchor signature line (small)
         f"drawtext=fontfile='{font}':text='{anchor_intro}':"
-        f"x=(w-text_w)/2:y=(h/2)+10:fontsize=32:fontcolor=0xFFE9B5,"
+        f"x=(w-text_w)/2:y={intro_y}:fontsize={intro_fs}:fontcolor=0xFFE9B5,"
         # Title below
         f"drawtext=fontfile='{font}':text='{title_safe}':"
-        f"x=(w-text_w)/2:y=(h/2)+80:fontsize=40:fontcolor=white,"
+        f"x=(w-text_w)/2:y={title_y}:fontsize={title_fs}:fontcolor=white,"
         # Source
         f"drawtext=fontfile='{font}':text='{source_safe}':"
-        f"x=(w-text_w)/2:y=(h/2)+150:fontsize=24:fontcolor=0xCCCCCC"
+        f"x=(w-text_w)/2:y={source_y}:fontsize={source_fs}:fontcolor=0xCCCCCC"
     )
 
     # geq mask: alpha is 255 when inside the growing circle, else 0.
@@ -488,13 +580,29 @@ def build_outro_card_cmd(
     dur = style.outro_seconds
     max_r = int((style.width**2 + style.height**2) ** 0.5 / 2) + 20
 
+    if style.is_vertical:
+        closing_fs = 50
+        closing_y = "(h/2)-150"
+        accent_y = "(h/2)-60"
+        accent_w_px = 320
+        name_fs = 100
+        name_y = "(h/2)+0"
+    else:
+        closing_fs = 44
+        closing_y = "(h/2)-80"
+        accent_y = "(h/2)+10"
+        accent_w_px = 320
+        name_fs = 80
+        name_y = "(h/2)+50"
+
     content_vf = (
         f"drawbox=x=0:y=0:w=iw:h=ih:color=0x{primary}:t=fill,"
         f"drawtext=fontfile='{font}':text='{closing}':"
-        f"x=(w-text_w)/2:y=(h/2)-80:fontsize=44:fontcolor=white,"
-        f"drawbox=x=(iw/2)-160:y=(h/2)+10:w=320:h=6:color=0x{accent}:t=fill,"
+        f"x=(w-text_w)/2:y={closing_y}:fontsize={closing_fs}:fontcolor=white,"
+        f"drawbox=x=(iw/2)-{accent_w_px//2}:y={accent_y}:w={accent_w_px}:h=6:"
+        f"color=0x{accent}:t=fill,"
         f"drawtext=fontfile='{font}':text='{name}':"
-        f"x=(w-text_w)/2:y=(h/2)+50:fontsize=80:fontcolor=white"
+        f"x=(w-text_w)/2:y={name_y}:fontsize={name_fs}:fontcolor=white"
     )
 
     # Inverse iris: circle shrinks from full → 0 over duration.

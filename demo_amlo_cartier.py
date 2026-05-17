@@ -117,6 +117,8 @@ async def main() -> int:
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--lipsync", action="store_true",
                         help="Aplica Wav2Lip a las escenas con ancla (~+\$0.10/video)")
+    parser.add_argument("--vertical", action="store_true",
+                        help="Renderiza 1080×1920 (9:16) para Reels/TikTok/celular")
     args = parser.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -173,6 +175,7 @@ async def main() -> int:
         skip_replicate=args.mock,
         enable_video=True,
         enable_lip_sync=args.lipsync,
+        video_aspect_ratio="9:16" if args.vertical else "16:9",
     ))
     elementos = await orch.orchestrate_parallel(prompts)
     if not await orch.validate_outputs(elementos):
@@ -181,7 +184,10 @@ async def main() -> int:
 
     # 4. Compose with branding (anchor passed → custom intro/outro lines).
     compositor = VideoCompositor(
-        BrandingConfig(colors={"primary": "#235B4E", "accent": "#9F2241", "bg": "#000000"}),
+        BrandingConfig(
+            colors={"primary": "#235B4E", "accent": "#9F2241", "bg": "#000000"},
+            vertical=args.vertical,
+        ),
         news_title=NEWS.title,
         news_source=NEWS.source,
         anchor=anchor,

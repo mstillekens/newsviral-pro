@@ -132,6 +132,7 @@ class ConfigPro:
     enable_video: bool = True               # True = Seedance image→video; False = stills only
     style: str = "documentary"              # one of STYLE_VARIANTS keys
     enable_lip_sync: bool = False           # Wav2Lip on anchor scenes (~+$0.10/video)
+    vertical: bool = False                  # 9:16 1080×1920 (Reels/TikTok/cel)
 
 
 # ---------- Tareas 1-3: news → script ----------
@@ -270,6 +271,7 @@ async def tarea_4_replicate_pro(
             skip_replicate=skip_replicate,
             enable_video=config.enable_video,
             enable_lip_sync=config.enable_lip_sync,
+            video_aspect_ratio="9:16" if config.vertical else "16:9",
         )
         orchestrator = ReplicateOrchestrator(replicate_config)
         elementos = await orchestrator.orchestrate_parallel(prompts, config)
@@ -295,7 +297,7 @@ async def tarea_5_componer_video_pro(
     logger.info("🎬 TAREA 5: Composición Video Final", tiempo=True)
 
     try:
-        branding = BrandingConfig(colors=config.colores_morena)
+        branding = BrandingConfig(colors=config.colores_morena, vertical=config.vertical)
         compositor = VideoCompositor(
             branding, news_title=news_title, news_source=news_source, anchor=anchor
         )
@@ -481,6 +483,8 @@ def main() -> None:
                    help="Visual style variant for FLUX + Seedance prompts")
     p.add_argument("--lipsync", action="store_true",
                    help="Apply Wav2Lip to anchor scenes (~+\$0.10/video). Off by default.")
+    p.add_argument("--vertical", action="store_true",
+                   help="Render at 1080×1920 (9:16) for Reels/TikTok/celular en lugar de 1920×1080.")
     args = p.parse_args()
 
     config = ConfigPro(
@@ -494,6 +498,7 @@ def main() -> None:
         enable_video=not args.no_video,
         style=args.style,
         enable_lip_sync=args.lipsync,
+        vertical=args.vertical,
     )
 
     if not config.anthropic_api_key and not args.mock:
