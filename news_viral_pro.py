@@ -34,7 +34,7 @@ from news_image_finder import find_reference_image
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
 from script_writer import Script, ScriptWriter
 from run_logger import RunLogger
-from brand_style import STYLE_VARIANTS, anchor_for
+from brand_style import STYLE_VARIANTS, anchor_for, pick_voice_id_for
 
 
 # Lazy-load the anchor portrait manifest. The orchestrator can skip FLUX
@@ -341,12 +341,13 @@ async def produce_video_for_script(
             prompts["escena_2"]["reference_image_url"] = ref.url
             logger.info(f"📸 ref-image escena_2: {ref.source} → {ref.url[:80]}")
 
-    # Inject voice_params from env so the orchestrator passes the trained
-    # chilango voice (if any) to MiniMax. The orchestrator iterates only over
-    # escena_* keys so this top-level entry is safe to add.
-    minimax_voice_id = os.environ.get("MINIMAX_VOICE_ID", "")
-    if minimax_voice_id:
-        prompts = {**prompts, "voice_params": {"voice_id": minimax_voice_id, "language_boost": "Spanish"}}
+    # Pick a gender-matched MiniMax voice for this anchor. Priority chain:
+    # per-anchor env var → global env var → anchor's hard-coded default.
+    # See pick_voice_id_for() in brand_style.py for details.
+    anchor_obj = anchor_for(f"{news_title}\n{news_source}")
+    voice_id = pick_voice_id_for(anchor_obj, os.environ)
+    prompts = {**prompts, "voice_params": {"voice_id": voice_id, "language_boost": "Spanish"}}
+    logger.info(f"🎙  Voz para {anchor_obj.id} ({anchor_obj.gender}): {voice_id}")
 
     elementos = await tarea_4_replicate_pro(prompts, config, skip_replicate=mock)
     if elementos is None:

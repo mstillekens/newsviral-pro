@@ -142,6 +142,12 @@ class AnchorCharacter:
     voice_intro: str               # signature opener (used as guidance for Claude)
     visual_description: str        # FLUX-ready description, includes brand uniform
     closing_line: str              # signature outro phrase
+    gender: str = "male"           # "male" | "female" — used to pick gender-matched default voice
+    # MiniMax voice picked when nothing else is configured. We use the
+    # English_* voices because their phonetic engine ALSO handles Spanish
+    # cleanly via language_boost=Spanish, and they're the only ones whose
+    # voice_ids we've verified work on this account.
+    voice_id_minimax_default: str = "English_Trustworthy_Man"
     minimax_voice_id: Optional[str] = None  # if user has cloned a voice per anchor
 
 
@@ -158,6 +164,8 @@ ANCHORS: List[AnchorCharacter] = [
         id="don_polibruh",
         name="Don Polibruh",
         verticals=["politica", "seguridad"],
+        gender="male",
+        voice_id_minimax_default="English_Trustworthy_Man",
         voice_id_hint=(
             "Hombre chilango, 40s, ñero, ex-organizador del barrio. Habla con desconfianza "
             "inteligente, sabe leer entre líneas, frases como 'a ver a ver', 'ojo con esto', "
@@ -176,6 +184,8 @@ ANCHORS: List[AnchorCharacter] = [
         id="dona_chispas",
         name="Doña Chispas",
         verticals=["chismes", "espectaculos", "cultura"],
+        gender="female",
+        voice_id_minimax_default="English_Wiselady",
         voice_id_hint=(
             "Vecina chilanga del barrio, 55+, sabe todo el tea, lengua larga con cariño. "
             "Frases tipo 'mi reina', 'fíjate fíjate', 'ay diosito'. Te cuenta el chisme "
@@ -194,6 +204,8 @@ ANCHORS: List[AnchorCharacter] = [
         id="cuauh_banqueta",
         name="El Cuauh Banqueta",
         verticals=["deportes"],
+        gender="male",
+        voice_id_minimax_default="English_Trustworthy_Man",
         voice_id_hint=(
             "Chavo ñero, 28, ex-llanero, energía alta pero controlada. Frases tipo 'mete-mete', "
             "'no manches qué jugadón', 'va', 'simón'. Cuenta el deporte como si fuera "
@@ -211,6 +223,8 @@ ANCHORS: List[AnchorCharacter] = [
         id="compa_caribe",
         name="El Compa Caribe",
         verticals=["local", "clima", "turismo", "default"],
+        gender="male",
+        voice_id_minimax_default="English_Trustworthy_Man",
         voice_id_hint=(
             "Joven quintanarroense, 30, mezcla acento chilango+costeño. Frases con sabor: "
             "'mi loco', 'guapa', 'cero broma'. Casual pero con autoridad de quien vive aquí."
@@ -224,6 +238,24 @@ ANCHORS: List[AnchorCharacter] = [
         closing_line="Aquí seguimos, mi loco. Te platico cuando se ponga más bueno.",
     ),
 ]
+
+
+def pick_voice_id_for(anchor: AnchorCharacter, env: dict) -> str:
+    """Return the MiniMax voice_id to use for this anchor.
+
+    Priority:
+    1. Per-anchor cloned voice in env: MINIMAX_VOICE_ID_DON_POLIBRUH=…
+       (lets you clone a different chilango voice for each character)
+    2. Global cloned voice in env: MINIMAX_VOICE_ID=…
+       (legacy single-clone setup, applied to every anchor)
+    3. Anchor's hard-coded default (gender-matched built-in MiniMax voice)
+    """
+    per_anchor_key = f"MINIMAX_VOICE_ID_{anchor.id.upper()}"
+    return (
+        (env.get(per_anchor_key) or "").strip()
+        or (env.get("MINIMAX_VOICE_ID") or "").strip()
+        or anchor.voice_id_minimax_default
+    )
 
 
 def _anchor_by_id(aid: str) -> AnchorCharacter:

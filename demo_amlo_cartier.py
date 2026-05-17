@@ -30,7 +30,7 @@ from script_writer import ScriptWriter
 from replicate_orchestrator import ReplicateConfig, ReplicateOrchestrator
 from video_compositor import BrandingConfig, VideoCompositor
 from run_logger import RunLogger
-from brand_style import STYLE_VARIANTS, anchor_for, ANCHORS
+from brand_style import STYLE_VARIANTS, anchor_for, pick_voice_id_for, ANCHORS
 
 import json as _json
 
@@ -162,10 +162,9 @@ async def main() -> int:
     # stays visually consistent across runs (and we skip 2 FLUX calls).
     _inject_portrait_from_manifest(prompts, anchor.id)
 
-    vid = os.environ.get("MINIMAX_VOICE_ID", "")
-    if vid:
-        prompts["voice_params"] = {"voice_id": vid, "language_boost": "Spanish"}
-        logger.info(f"🎙  Usando voz clonada: {vid}")
+    voice_id = pick_voice_id_for(anchor, dict(os.environ))
+    prompts["voice_params"] = {"voice_id": voice_id, "language_boost": "Spanish"}
+    logger.info(f"🎙  Voz para {anchor.id} ({anchor.gender}): {voice_id}")
 
     orch = ReplicateOrchestrator(ReplicateConfig(
         api_token=os.environ["REPLICATE_API_TOKEN"],

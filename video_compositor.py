@@ -170,13 +170,27 @@ class VideoCompositor:
             input_args = ["-i", str(clip)]
             if audio and audio.exists():
                 input_args += ["-i", str(audio)]
-                # adelay=300|300 inserts 300ms of silence at the front of the
-                # audio so the narrator never starts mid-syllable at a scene
-                # boundary. apad then extends the audio with silence to fill
-                # the clip's full duration. Combined with `-shortest` below,
-                # output ends at the clip's natural end so we never run past
-                # the visual.
-                audio_filter = "[1:a]aresample=48000,adelay=300|300,apad[aout]"
+                # Build per-scene audio chain:
+                #   1. aresample 48k:          harmonize sample rate
+                #   2. afade out (last 400ms): keeps MiniMax's last syllable
+                #      from ending in a hard click before silence padding.
+                #      We probe duration so the fade fires at the right
+                #      moment regardless of how long the narrator went on.
+                #   3. adelay 300ms:           300ms breath at scene start so
+                #      the cut from previous scene's tail isn't mid-syllable.
+                #   4. apad:                   extend with silence to fill
+                #      the clip's full duration (–shortest at output keeps
+                #      it from running past the visual).
+                #
+                # We do the fade BEFORE adelay so the duration math is in the
+                # original audio's timeline.
+                audio_dur = self._get_audio_duration(str(audio))
+                fade_start = max(0.1, audio_dur - 0.4)
+                audio_filter = (
+                    "[1:a]aresample=48000,"
+                    f"afade=t=out:st={fade_start:.3f}:d=0.4,"
+                    "adelay=300|300,apad[aout]"
+                )
                 audio_map = ["-map", "[aout]"]
             else:
                 input_args += [
