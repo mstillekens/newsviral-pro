@@ -166,10 +166,24 @@ class VideoCompositor:
         #    concat-demuxer can stream-copy them.
         scene_files: List[Path] = []
         for idx, key in enumerate(keys, start=1):
-            clip = Path(videos[key]).resolve()
+            raw_clip = videos[key]
             audio_path_str = audios.get(key, "")
-            audio = Path(audio_path_str).resolve() if audio_path_str else None
             scene_file = self.work_dir / f"scene_{idx:02d}.mp4"
+
+            # Sentinel handling: if Seedance failed for this scene, substitute
+            # a 5-second slate so the rest of the video still composes.
+            if raw_clip == "FAILED":
+                logger.warning(f"⚠️  Scene {idx} ({key}) is FAILED — substituting slate")
+                slate_path = self._render_slate(idx, "ESCENA NO DISPONIBLE")
+                clip = Path(slate_path).resolve()
+            else:
+                clip = Path(raw_clip).resolve()
+
+            # If audio failed/sentinel, use silence of the clip's duration.
+            if audio_path_str in ("SILENT", ""):
+                audio = None
+            else:
+                audio = Path(audio_path_str).resolve()
 
             input_args = ["-i", str(clip)]
             if audio and audio.exists():
@@ -312,6 +326,33 @@ class VideoCompositor:
         branded_video = self.work_dir / "composed_branded.mp4"
         self.apply_branding(str(output_video), str(branded_video))
         return str(branded_video)
+
+    def _render_slate(self, scene_idx: int, message: str) -> str:
+        """Render a 5s solid slate with a message. Used when an upstream
+        scene fails (e.g. Seedance returns FAILED sentinel) so the
+        compositor can still produce a complete video instead of crashing.
+
+        Returns the local mp4 path."""
+        slate_file = self.work_dir / f"slate_{scene_idx:02d}.mp4"
+        font = self.style.font_path or "/System/Library/Fonts/Supplemental/Arial.ttf"
+        primary = self.style.primary_hex
+        text = message.replace("'", "")[:50]
+        vf = (
+            f"drawbox=x=0:y=0:w=iw:h=ih:color=0x{primary}:t=fill,"
+            f"drawtext=fontfile='{font}':text='{text}':"
+            f"x=(w-text_w)/2:y=(h-text_h)/2:fontsize=64:fontcolor=white"
+        )
+        cmd = [
+            FFMPEG_BIN, "-y",
+            "-f", "lavfi", "-t", "5",
+            "-i", f"color=c=0x{primary}:s={self.style.width}x{self.style.height}:r={self.style.fps}",
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+            str(slate_file),
+        ]
+        subprocess.run(cmd, capture_output=True, check=True, timeout=60)
+        logger.info(f"🛑 Slate rendered: {slate_file}")
+        return str(slate_file)
 
     def _get_audio_duration(self, audio_path: str) -> float:
         """Get duration of audio file in seconds"""

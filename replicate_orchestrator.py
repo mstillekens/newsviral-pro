@@ -510,12 +510,17 @@ class ReplicateOrchestrator:
             tasks.append(self._animate_single(url, mp, i))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: Dict[str, str] = {}
+        failed: List[str] = []
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 logger.error(f"❌ Video {i+1}: {r}")
+                out[f"escena_{i+1}"] = "FAILED"   # sentinel → compositor renders a slate
+                failed.append(f"escena_{i+1}")
             else:
                 out[f"escena_{i+1}"] = r
-        logger.info(f"✅ Videos: {len(out)}/{len(motion_prompts)}")
+        if failed:
+            logger.warning(f"⚠️  Substituting slates for {len(failed)} failed scenes: {failed}")
+        logger.info(f"✅ Videos: {len(out) - len(failed)}/{len(motion_prompts)}")
         return out
 
     # ----- AUDIO (MiniMax) -----
@@ -539,9 +544,11 @@ class ReplicateOrchestrator:
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 logger.error(f"❌ Audio {i+1}: {r}")
+                out[f"escena_{i+1}"] = "SILENT"   # sentinel → compositor uses silence
             else:
                 out[f"escena_{i+1}"] = r
-        logger.info(f"✅ Audios: {len(out)}/{len(scripts)}")
+        n_ok = sum(1 for v in out.values() if v != "SILENT")
+        logger.info(f"✅ Audios: {n_ok}/{len(scripts)}")
         return out
 
     # MiniMax speech-02-hd's full emotion enum, validated empirically.
@@ -735,21 +742,32 @@ class ReplicateOrchestrator:
         return resultado
 
     async def validate_outputs(self, output_dict: Dict) -> bool:
-        """Confirm primary outputs exist on disk."""
+        """Confirm every scene has *some* output, including sentinels.
+
+        Returns True if every scene resolved to either a real file or a
+        sentinel marker the compositor knows how to handle. Returns False
+        only if we have ZERO usable scenes (total failure)."""
         videos = output_dict.get("videos", {}) or {}
         images = output_dict.get("imagenes", {}) or {}
         audios = output_dict.get("audios", {}) or {}
 
         primary = videos if videos else images
-
-        logger.info("🔍 Validating outputs...")
-        for d in (primary, audios):
-            for key, path in d.items():
-                if not Path(path).exists():
-                    logger.error(f"❌ Missing: {path}")
-                    return False
-        if not primary or not audios:
-            logger.error("❌ No primary visuals or audios produced")
+        n_real_primary = sum(
+            1 for v in primary.values()
+            if v not in ("FAILED", "SILENT") and Path(v).exists()
+        )
+        if n_real_primary == 0:
+            logger.error("❌ Zero real primary visuals; cannot compose")
             return False
-        logger.info("✅ All outputs validated")
+
+        # Coerce missing audio files to the SILENT sentinel so compositor can
+        # substitute silence instead of crashing.
+        for key, path in list(audios.items()):
+            if path == "SILENT":
+                continue
+            if not Path(path).exists():
+                logger.warning(f"⚠️  Audio missing for {key}: {path}; treating as silent")
+                audios[key] = "SILENT"
+
+        logger.info(f"✅ Validated: {n_real_primary} real visuals + {len(audios)} audio slots")
         return True
