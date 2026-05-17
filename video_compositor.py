@@ -29,6 +29,7 @@ from brand_style import (
     BrandStyle,
     build_bug_filter,
     build_intro_card_cmd,
+    build_tiktok_cover_cmd,
     build_lower_third_filter,
     build_outro_card_cmd,
 )
@@ -49,6 +50,8 @@ class BrandingConfig:
     watermark_position: str = "bottom-right"
     watermark_opacity: float = 0.7
     vertical: bool = False    # True → 9:16 1080×1920 output for Reels/TikTok/cel
+    narrative_mode: str = "anchor_camera"   # see script_writer.NARRATIVE_MODES
+    cover_kicker: str = ""    # short kicker text shown above the title on TikTok cover
 
     def to_brand_style(self) -> BrandStyle:
         kwargs = dict(
@@ -411,12 +414,29 @@ class VideoCompositor:
             subprocess.run(["cp", input_video, output_video], check=True)
             return output_video
 
-        # 2. Render intro + outro cards (Looney-Tunes-style iris in/out,
-        #    customized with the anchor's intro/closing lines when present).
-        intro_cmd = build_intro_card_cmd(
-            self.style, intro_path, self.news_title, self.news_source, anchor=self.anchor
-        )
-        outro_cmd = build_outro_card_cmd(self.style, outro_path, anchor=self.anchor)
+        # 2. Render intro + outro cards. In voiceover_only mode we use a
+        #    flat TikTok-style cover (no iris animation, no anchor signature
+        #    lines) — the brand requirement for vertical scroll-stopping
+        #    content. Other modes keep the looney-tunes iris cards.
+        narrative_mode = getattr(self.branding, "narrative_mode", "anchor_camera")
+        if narrative_mode == "voiceover_only":
+            intro_cmd = build_tiktok_cover_cmd(
+                self.style, intro_path, self.news_title,
+                kicker=getattr(self.branding, "cover_kicker", ""),
+                duration_s=self.style.intro_seconds,
+            )
+            # Same TikTok-style card for outro, no anchor signature line.
+            outro_cmd = build_tiktok_cover_cmd(
+                self.style, outro_path,
+                title=self.style.newsroom_name,
+                kicker="",
+                duration_s=self.style.outro_seconds,
+            )
+        else:
+            intro_cmd = build_intro_card_cmd(
+                self.style, intro_path, self.news_title, self.news_source, anchor=self.anchor
+            )
+            outro_cmd = build_outro_card_cmd(self.style, outro_path, anchor=self.anchor)
         if not intro_cmd or not outro_cmd:
             # If we suddenly can't build cards, just return the graded body.
             logger.warning("Intro/outro skipped; returning graded body only")
@@ -482,7 +502,14 @@ class VideoCompositor:
                    bitrate: Optional[str] = None,
                    resolution: Optional[str] = None) -> Dict:
         """Export final MP4 video. Defaults pulled from the active BrandStyle
-        so a 9:16 vertical pipeline exports at 1080×1920 (not 1920×1080)."""
+        so a 9:16 vertical pipeline exports at 1080×1920 (not 1920×1080).
+
+        Belt-and-suspenders audio safety on the final encode:
+          - apad: ensure the audio track is at least as long as the video
+            (prevents a black hole at the tail that some players glitch on)
+          - afade=t=out 600ms before end: clean cinematic close, no clicks
+          - loudnorm: broadcast standard, prevents loud surprises
+        """
         bitrate = bitrate or self.style.bitrate
         resolution = resolution or f"{self.style.width}x{self.style.height}"
         logger.info(f"📤 Exporting MP4...")
@@ -492,6 +519,20 @@ class VideoCompositor:
         output_file = self.output_dir / "video_viral.mp4"
 
         width, height = resolution.split("x")
+
+        # Build the audio filter chain with a tail-anchored fade-out.
+        # `afade=t=out` with `st=<input-duration - 0.6>` cleanly closes the
+        # last 600ms of audio, on top of the per-scene 400ms fades already
+        # applied during composition. This is the final firewall against
+        # the "ruido trabado al final" issue we observed.
+        dur_s = self._probe_duration_seconds(video_path)
+        af_chain_parts = []
+        if dur_s and dur_s > 1.0:
+            fade_start = max(0.1, dur_s - 0.6)
+            af_chain_parts.append(f"afade=t=out:st={fade_start:.3f}:d=0.6")
+        # Always apply loudnorm at export for consistency.
+        af_chain_parts.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+        af_chain = ",".join(af_chain_parts)
 
         cmd = [
             FFMPEG_BIN, "-y",
@@ -504,6 +545,7 @@ class VideoCompositor:
             "-c:a", "aac",
             "-b:a", "192k",
             "-ar", "48000",
+            "-af", af_chain,
             str(output_file)
         ]
 
@@ -541,6 +583,23 @@ class VideoCompositor:
         except subprocess.CalledProcessError as e:
             logger.error(f"❌ Export failed: {e.stderr.decode()}")
             raise
+
+    def _probe_duration_seconds(self, video_path: str) -> Optional[float]:
+        """Return container duration in seconds, or None if probe fails."""
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=True, timeout=30
+            )
+            return float(result.stdout.strip())
+        except Exception as e:
+            logger.warning(f"ffprobe duration failed: {e}")
+            return None
 
     def _get_video_duration(self, video_path: str) -> str:
         """Get video duration as MM:SS"""

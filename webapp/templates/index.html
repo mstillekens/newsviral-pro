@@ -13,16 +13,31 @@
   <button type="submit">↻ Refrescar noticias QR</button>
 </form>
 
+{% set mode_labels = {
+  "anchor_camera": "ancla a cámara",
+  "voiceover_only": "voz en off",
+  "hybrid_storytelling": "híbrido"
+} %}
 <details class="settings">
   <summary>
     ⚙️ Ajustes del video
     <span class="settings-tags">
+      <span class="tag">{{ mode_labels[current_mode] or current_mode }}</span>
       <span class="tag">{{ current_style }}</span>
+      <span class="tag">{{ current_num_scenes }} esc</span>
+      <span class="tag">{{ current_target_duration }}s</span>
       {% if current_lipsync %}<span class="tag on">lip-sync</span>{% endif %}
       {% if current_vertical %}<span class="tag on">9:16</span>{% endif %}
     </span>
   </summary>
-  <form action="/settings" method="post" class="settings-form">
+  <form action="/settings" method="post" class="settings-form" id="settings-form">
+    <label>Modo narrativo
+      <select name="narrative_mode" id="narrative-mode">
+        {% for m in narrative_modes %}
+        <option value="{{ m }}" {% if m == current_mode %}selected{% endif %}>{{ mode_labels[m] or m }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>Estilo visual
       <select name="style">
         {% for s in style_options %}
@@ -30,9 +45,23 @@
         {% endfor %}
       </select>
     </label>
-    <label class="toggle">
-      <input type="checkbox" name="lipsync" value="on" {% if current_lipsync %}checked{% endif %}>
-      <span>Lip-sync (+$0.10/video) — boca se mueve con la voz</span>
+    <label>Número de escenas
+      <select name="num_scenes">
+        {% for n in [3, 4, 5, 6] %}
+        <option value="{{ n }}" {% if n == current_num_scenes %}selected{% endif %}>{{ n }} escenas</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Duración objetivo
+      <select name="target_duration">
+        {% for d in [15, 30, 45, 60] %}
+        <option value="{{ d }}" {% if d == current_target_duration %}selected{% endif %}>{{ d }} segundos</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="toggle" id="lipsync-toggle">
+      <input type="checkbox" name="lipsync" value="on" {% if current_lipsync %}checked{% endif %} id="lipsync-input">
+      <span>Lip-sync (+$0.10/video) — boca se mueve con la voz<br><small class="hint" id="lipsync-hint" style="display:none">Auto-desactivado en modo voz en off (no hay ancla en cámara).</small></span>
     </label>
     <label class="toggle">
       <input type="checkbox" name="vertical" value="on" {% if current_vertical %}checked{% endif %}>
@@ -42,6 +71,33 @@
     <p class="hint">Los próximos videos que generes usarán estos ajustes.</p>
   </form>
 </details>
+<script>
+  // When narrative_mode = voiceover_only, lip-sync makes no sense (no anchor
+  // on camera). Disable the toggle visually + uncheck so the form submit
+  // sends lipsync="" which the backend honors.
+  (function() {
+    var modeSel = document.getElementById('narrative-mode');
+    var lipInput = document.getElementById('lipsync-input');
+    var lipHint = document.getElementById('lipsync-hint');
+    var lipToggle = document.getElementById('lipsync-toggle');
+    function sync() {
+      var isVO = modeSel.value === 'voiceover_only';
+      lipInput.disabled = isVO;
+      if (isVO) {
+        lipInput.checked = false;
+        lipHint.style.display = 'inline';
+        lipToggle.style.opacity = '0.5';
+      } else {
+        lipHint.style.display = 'none';
+        lipToggle.style.opacity = '1';
+      }
+    }
+    if (modeSel && lipInput) {
+      modeSel.addEventListener('change', sync);
+      sync();
+    }
+  })();
+</script>
 
 {% if not pending %}
   <p class="empty">No hay noticias pendientes.<br>Refresca arriba para traer las del día.</p>

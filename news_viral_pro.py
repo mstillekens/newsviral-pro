@@ -32,7 +32,11 @@ from video_compositor import VideoCompositor, BrandingConfig
 from news_sources import NewsItem, fetch_google_news, filter_by_date, enrich_with_body
 from news_image_finder import find_reference_image_with_fallback
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
-from script_writer import Script, ScriptWriter
+from script_writer import (
+    Script, ScriptWriter,
+    NARRATIVE_MODES, DEFAULT_MODE,
+    anchor_scene_keys, event_scene_keys, scene_keys_in_order,
+)
 from run_logger import RunLogger
 from brand_style import STYLE_VARIANTS, anchor_for, pick_voice_id_for
 from news_enrichment import (
@@ -63,14 +67,21 @@ def _load_anchor_manifest() -> Dict[str, Dict[str, str]]:
     return _ANCHOR_MANIFEST
 
 
-def _inject_anchor_portraits(prompts: Dict, anchor_id: str) -> None:
-    """Attach the cached portrait URL to scenes 1 and 3 (the anchor scenes).
+def _inject_anchor_portraits(
+    prompts: Dict, anchor_id: str, scene_keys: Optional[List[str]] = None,
+) -> None:
+    """Attach the cached portrait URL to the scene keys that feature the anchor.
 
-    Convention from script_writer: escena_1 = anchor hook, escena_2 = event,
-    escena_3 = anchor close. We tag 1 and 3 with the cached portrait so the
-    orchestrator skips FLUX for them entirely. Scene 2 stays untouched so it
-    can use FLUX text-to-image (or canny+ref-image when scraped).
+    `scene_keys` defaults to scenes 1 and 3 for backwards-compat with the
+    legacy 3-scene anchor_camera pipeline. M6 callers pass an explicit list
+    computed by `script_writer.anchor_scene_keys(scenes, mode)` so that
+    voiceover_only (no anchor) and hybrid_storytelling (anchor in scene 1
+    only) skip portrait injection where appropriate.
     """
+    if scene_keys is None:
+        scene_keys = ["escena_1", "escena_3"]
+    if not scene_keys:
+        return
     manifest = _load_anchor_manifest()
     entry = manifest.get(anchor_id)
     if not entry:
@@ -79,7 +90,7 @@ def _inject_anchor_portraits(prompts: Dict, anchor_id: str) -> None:
     url = entry.get("url")
     if not url:
         return
-    for key in ("escena_1", "escena_3"):
+    for key in scene_keys:
         if key in prompts and isinstance(prompts[key], dict):
             prompts[key]["anchor_portrait_url"] = url
 
@@ -143,6 +154,10 @@ class ConfigPro:
     enable_enrichment: bool = True
     strict_enrichment: bool = False         # if True, skip items that fail validation
     enrichment_threshold: int = 70          # 0-100, score below this = failed
+    # M6 narrative controls
+    narrative_mode: str = DEFAULT_MODE      # anchor_camera|voiceover_only|hybrid_storytelling
+    target_scenes: int = 3                  # 2-8 (3 = legacy default)
+    target_duration_s: int = 30             # 15-90s
 
 
 # ---------- Tareas 1-3: news → script ----------
@@ -323,15 +338,20 @@ async def tarea_2_3_scripts_and_prompts(
                 # else: continue with the un-enriched item
 
         try:
-            script = await asyncio.to_thread(writer.write, item)
+            script = await asyncio.to_thread(
+                writer.write, item, None,
+                mode=config.narrative_mode,
+                num_scenes=config.target_scenes,
+                target_duration_s=config.target_duration_s,
+            )
             # If enrichment produced derived scenes, override the narrations
-            # while keeping ScriptWriter's imagen/motion/emotion fields intact.
+            # for those keys (works for both 3-scene legacy and N-scene M6).
             derived = getattr(item, "_enriched_scenes", None)
             if isinstance(derived, dict):
-                for k in ("escena_1", "escena_2", "escena_3"):
-                    txt = derived.get(k)
+                for k, txt in derived.items():
                     if txt and k in script.scenes:
                         script.scenes[k]["audio_script"] = txt
+                        script.scenes[k]["narration"] = txt
             scripts.append(script)
             final_items.append(item)
         except Exception as e:
@@ -384,7 +404,11 @@ async def tarea_5_componer_video_pro(
     logger.info("🎬 TAREA 5: Composición Video Final", tiempo=True)
 
     try:
-        branding = BrandingConfig(colors=config.colores_morena, vertical=config.vertical)
+        branding = BrandingConfig(
+            colors=config.colores_morena,
+            vertical=config.vertical,
+            narrative_mode=config.narrative_mode,
+        )
         compositor = VideoCompositor(
             branding, news_title=news_title, news_source=news_source, anchor=anchor
         )
@@ -415,35 +439,40 @@ async def produce_video_for_script(
 
     prompts = script.to_prompts_dict()
 
-    # Anchor portrait injection. Scenes 1 and 3 always feature the anchor;
-    # using the cached portrait keeps the character visually identical
-    # across every video and skips a FLUX call per scene.
-    _inject_anchor_portraits(prompts, script.anchor_id)
+    # Anchor portrait injection — only on scenes that actually feature the
+    # anchor on camera. Computed from script.mode so voiceover_only skips
+    # this entirely and hybrid only tags the opening scene.
+    mode = getattr(script, "mode", DEFAULT_MODE)
+    anchor_keys = anchor_scene_keys(prompts, mode)
+    if anchor_keys:
+        _inject_anchor_portraits(prompts, script.anchor_id, anchor_keys)
 
-    # Reference image enrichment for scene 2 (the "event" scene per our
-    # template). If we can scrape an og:image from the news URL we pass it
-    # as control_image to flux-canny-pro, which preserves the source's
-    # composition while applying the style prompt — so caricatures look
-    # like the actual subjects.
-    # We deliberately attach the ref image only to scene 2; scenes 1 and 3
-    # show the anchor and don't benefit from outside imagery.
-    if "escena_2" in prompts:
-        # Prefer the LLM-selected image from NewsEnrichmentSystem when the
-        # caller passed a fully-enriched item; otherwise fall back to the
-        # DuckDuckGo-augmented og:image scraper.
-        selected_urls = list(getattr(item, "selected_image_urls", []) or []) if item else []
-        if selected_urls:
-            # Enrichment chose 3 images; #2 = the event scene.
-            chosen = selected_urls[1] if len(selected_urls) > 1 else selected_urls[0]
-            prompts["escena_2"]["reference_image_url"] = chosen
-            logger.info(f"📸 ref-image escena_2 (enriched): {chosen[:80]}")
-        elif script.news_url:
-            ref = await asyncio.to_thread(
+    # Reference image enrichment: attach to ALL event scenes (those without
+    # anchor on camera). In anchor_camera 3-scene legacy this is just
+    # scene 2; in voiceover_only it's every scene.
+    event_keys = event_scene_keys(prompts, mode)
+    selected_urls = list(getattr(item, "selected_image_urls", []) or []) if item else []
+
+    if event_keys:
+        scraped_ref = None
+        if not selected_urls and script.news_url:
+            scraped_ref = await asyncio.to_thread(
                 find_reference_image_with_fallback, script.news_url, news_title,
             )
-            if ref:
-                prompts["escena_2"]["reference_image_url"] = ref.url
-                logger.info(f"📸 ref-image escena_2: {ref.source} → {ref.url[:80]}")
+        for i, key in enumerate(event_keys):
+            if not isinstance(prompts.get(key), dict):
+                continue
+            if selected_urls:
+                # Distribute the 3 enrichment-selected images across event
+                # scenes (cycle through them — looks more varied).
+                chosen = selected_urls[i % len(selected_urls)]
+                prompts[key]["reference_image_url"] = chosen
+                logger.info(f"📸 ref-image {key} (enriched): {chosen[:80]}")
+            elif scraped_ref:
+                prompts[key]["reference_image_url"] = scraped_ref.url
+                logger.info(
+                    f"📸 ref-image {key}: {scraped_ref.source} → {scraped_ref.url[:80]}"
+                )
 
     # Pick a gender-matched MiniMax voice for this anchor. Priority chain:
     # per-anchor env var → global env var → anchor's hard-coded default.
@@ -594,7 +623,23 @@ def main() -> None:
                    help="Skip items that fail enrichment quality threshold.")
     p.add_argument("--enrich-threshold", type=int, default=70,
                    help="Quality score 0-100 below which enrichment is 'failed' (default 70).")
+    p.add_argument("--mode", default=DEFAULT_MODE, choices=list(NARRATIVE_MODES),
+                   help="Narrative mode: anchor_camera (default, 3-scene anchor), "
+                        "voiceover_only (TikTok-style narration, no anchor), or "
+                        "hybrid_storytelling (anchor hook + voice-over rest).")
+    p.add_argument("--scenes", type=int, default=3,
+                   help="Number of scenes (2-8). Default 3.")
+    p.add_argument("--duration", type=int, default=30,
+                   help="Target total duration in seconds (15-90). Default 30.")
     args = p.parse_args()
+
+    # voiceover_only forcibly disables lip-sync regardless of --lipsync.
+    if args.mode == "voiceover_only" and args.lipsync:
+        print(
+            "ℹ️  voiceover_only mode → lip-sync auto-disabled (no anchor on camera).",
+            file=sys.stderr,
+        )
+        args.lipsync = False
 
     config = ConfigPro(
         replicate_api_token=os.environ.get("REPLICATE_API_TOKEN", ""),
@@ -611,6 +656,9 @@ def main() -> None:
         enable_enrichment=not args.no_enrich,
         strict_enrichment=args.strict_enrich,
         enrichment_threshold=args.enrich_threshold,
+        narrative_mode=args.mode,
+        target_scenes=args.scenes,
+        target_duration_s=args.duration,
     )
 
     if not config.anthropic_api_key and not args.mock:

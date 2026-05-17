@@ -47,7 +47,10 @@ from fastapi.templating import Jinja2Templates
 from news_sources import NewsItem, fetch_google_news, enrich_with_body
 from news_scorer import ScoredItem, load_weights, save_weights, score_items, update_weights_from_feedback
 from news_image_finder import find_reference_image_with_fallback
-from script_writer import ScriptWriter
+from script_writer import (
+    ScriptWriter, NARRATIVE_MODES, DEFAULT_MODE,
+    anchor_scene_keys, event_scene_keys,
+)
 from replicate_orchestrator import ReplicateConfig, ReplicateOrchestrator
 from video_compositor import BrandingConfig, VideoCompositor
 from run_logger import RunLogger
@@ -172,9 +175,20 @@ def _env_default_style() -> str:
     return os.environ.get("WEBAPP_STYLE", "caricature")
 
 
-def _inject_anchor_portrait_for(prompts: Dict[str, Any], anchor_id: str) -> None:
-    """Attach the cached portrait URL to scenes 1 and 3 so FLUX gets skipped
-    for the anchor scenes and the character stays visually consistent."""
+def _inject_anchor_portrait_for(
+    prompts: Dict[str, Any], anchor_id: str,
+    scene_keys: Optional[List[str]] = None,
+) -> None:
+    """Attach the cached portrait URL to the scene keys that feature the anchor.
+
+    `scene_keys` defaults to ("escena_1", "escena_3") for the legacy 3-scene
+    anchor_camera pipeline. M6 callers pass an explicit list from
+    `script_writer.anchor_scene_keys(scenes, mode)`.
+    """
+    if scene_keys is None:
+        scene_keys = ["escena_1", "escena_3"]
+    if not scene_keys:
+        return
     path = ROOT / "anchor_portraits" / "manifest.json"
     if not path.exists():
         return
@@ -186,7 +200,7 @@ def _inject_anchor_portrait_for(prompts: Dict[str, Any], anchor_id: str) -> None
     url = (entry or {}).get("url")
     if not url:
         return
-    for key in ("escena_1", "escena_3"):
+    for key in scene_keys:
         if key in prompts and isinstance(prompts[key], dict):
             prompts[key]["anchor_portrait_url"] = url
 
@@ -223,6 +237,25 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
         style_name = "caricature"
     use_lipsync = bool(opts.get("lipsync", _env_flag("WEBAPP_LIPSYNC")))
     use_vertical = bool(opts.get("vertical", _env_flag("WEBAPP_VERTICAL")))
+    # M6 narrative mode — read from settings with safe defaults.
+    narrative_mode = (opts.get("narrative_mode")
+                      or os.environ.get("WEBAPP_NARRATIVE_MODE", DEFAULT_MODE)).strip()
+    if narrative_mode not in NARRATIVE_MODES:
+        narrative_mode = DEFAULT_MODE
+    try:
+        target_scenes = int(opts.get("num_scenes") or os.environ.get("WEBAPP_NUM_SCENES", 3))
+    except (TypeError, ValueError):
+        target_scenes = 3
+    target_scenes = max(2, min(target_scenes, 8))
+    try:
+        target_duration_s = int(opts.get("target_duration") or os.environ.get("WEBAPP_TARGET_DURATION", 30))
+    except (TypeError, ValueError):
+        target_duration_s = 30
+    target_duration_s = max(10, min(target_duration_s, 90))
+    # voiceover_only forcibly disables lip-sync (no anchor on camera).
+    if narrative_mode == "voiceover_only" and use_lipsync:
+        logger.info(f"Job {job_id}: voiceover_only → lipsync auto-disabled")
+        use_lipsync = False
 
     async with GEN_LOCK:
         try:
@@ -255,28 +288,43 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
                 _set_stage("scripting", enrichment_error=str(e))
 
             anchor = anchor_for(f"{item.title}\n{item.snippet}\n{item.body}")
-            script = await asyncio.to_thread(writer.write, item, anchor)
-            _set_stage("rendering")
+            script = await asyncio.to_thread(
+                writer.write, item, anchor,
+                mode=narrative_mode,
+                num_scenes=target_scenes,
+                target_duration_s=target_duration_s,
+            )
+            _set_stage("rendering",
+                       narrative_mode=narrative_mode,
+                       scene_count=len(script.scenes))
 
             prompts = dict(script.scenes)
-            # Anchor portrait → scenes 1 and 3 (kept consistent across runs).
-            _inject_anchor_portrait_for(prompts, anchor.id)
+            # Anchor portrait → only on the scenes that actually feature
+            # the anchor on camera (anchor_camera: first+last, hybrid: first,
+            # voiceover_only: none).
+            anchor_keys = anchor_scene_keys(prompts, narrative_mode)
+            if anchor_keys:
+                _inject_anchor_portrait_for(prompts, anchor.id, anchor_keys)
 
-            # ref-image for escena_2: prefer enrichment-picked image (when
-            # the LLM scored it best from 8+ scraped), else fall back to the
-            # DuckDuckGo-augmented og:image scraper from main.
-            if "escena_2" in prompts:
-                selected = list(getattr(item, "selected_image_urls", None) or [])
+            # Reference image enrichment for event scenes (those WITHOUT
+            # anchor). Distribute the 3 LLM-selected images across event
+            # scenes (cycled). Fallback to DuckDuckGo-augmented og:image.
+            event_keys = event_scene_keys(prompts, narrative_mode)
+            selected = list(getattr(item, "selected_image_urls", None) or [])
+            scraped_ref = None
+            if event_keys and not selected and item.url:
+                scraped_ref = await asyncio.to_thread(
+                    find_reference_image_with_fallback, item.url, item.title,
+                )
+            for i, key in enumerate(event_keys):
+                if not isinstance(prompts.get(key), dict):
+                    continue
                 if selected:
-                    chosen = selected[1] if len(selected) > 1 else selected[0]
-                    prompts["escena_2"]["reference_image_url"] = chosen
-                    logger.info(f"📸 ref-image escena_2 (enriched): {chosen[:80]}")
-                elif item.url:
-                    ref = await asyncio.to_thread(
-                        find_reference_image_with_fallback, item.url, item.title,
-                    )
-                    if ref:
-                        prompts["escena_2"]["reference_image_url"] = ref.url
+                    chosen = selected[i % len(selected)]
+                    prompts[key]["reference_image_url"] = chosen
+                    logger.info(f"📸 ref-image {key} (enriched): {chosen[:80]}")
+                elif scraped_ref:
+                    prompts[key]["reference_image_url"] = scraped_ref.url
 
             # Gender-matched voice (with optional cloned override).
             voice_id = pick_voice_id_for(anchor, dict(os.environ))
@@ -297,6 +345,10 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
                 BrandingConfig(
                     colors={"primary": "#235B4E", "accent": "#9F2241", "bg": "#000000"},
                     vertical=use_vertical,
+                    narrative_mode=narrative_mode,
+                    cover_kicker=(
+                        item.region_hits[0].upper() if item.region_hits else ""
+                    ),
                 ),
                 news_title=item.title,
                 news_source=item.source,
@@ -422,6 +474,10 @@ async def index(request: Request, _: None = Depends(require_auth)):
         "current_style": settings.get("style", _env_default_style()),
         "current_lipsync": settings.get("lipsync", _env_flag("WEBAPP_LIPSYNC")),
         "current_vertical": settings.get("vertical", _env_flag("WEBAPP_VERTICAL")),
+        "narrative_modes": list(NARRATIVE_MODES),
+        "current_mode": settings.get("narrative_mode", DEFAULT_MODE),
+        "current_num_scenes": settings.get("num_scenes", 3),
+        "current_target_duration": settings.get("target_duration", 30),
     })
 
 
@@ -432,14 +488,32 @@ async def update_settings(
     style: str = Form("caricature"),
     lipsync: str = Form(""),    # "on" or ""
     vertical: str = Form(""),
+    narrative_mode: str = Form(DEFAULT_MODE),
+    num_scenes: str = Form("3"),
+    target_duration: str = Form("30"),
 ):
     """Persist generation settings so subsequent /decide calls pick them up."""
     new_style = style if style in STYLE_VARIANTS else "caricature"
+    nm = narrative_mode if narrative_mode in NARRATIVE_MODES else DEFAULT_MODE
+    try:
+        ns = max(2, min(int(num_scenes), 8))
+    except (TypeError, ValueError):
+        ns = 3
+    try:
+        td = max(10, min(int(target_duration), 90))
+    except (TypeError, ValueError):
+        td = 30
+    # voiceover_only forcibly disables lipsync regardless of toggle.
+    lip = lipsync == "on" and nm != "voiceover_only"
+
     def mut(state):
         state["settings"] = {
             "style": new_style,
-            "lipsync": lipsync == "on",
+            "lipsync": lip,
             "vertical": vertical == "on",
+            "narrative_mode": nm,
+            "num_scenes": ns,
+            "target_duration": td,
         }
     update_state(mut)
     return RedirectResponse(url="/", status_code=303)
@@ -612,6 +686,16 @@ async def decide(
             "style": current_settings.get("style", _env_default_style()),
             "lipsync": current_settings.get("lipsync", _env_flag("WEBAPP_LIPSYNC")),
             "vertical": current_settings.get("vertical", _env_flag("WEBAPP_VERTICAL")),
+            "narrative_mode": current_settings.get(
+                "narrative_mode",
+                os.environ.get("WEBAPP_NARRATIVE_MODE", DEFAULT_MODE),
+            ),
+            "num_scenes": current_settings.get(
+                "num_scenes", int(os.environ.get("WEBAPP_NUM_SCENES", 3)),
+            ),
+            "target_duration": current_settings.get(
+                "target_duration", int(os.environ.get("WEBAPP_TARGET_DURATION", 30)),
+            ),
         }}
 
         def mut_with_job(s):

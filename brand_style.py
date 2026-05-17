@@ -633,3 +633,124 @@ def build_outro_card_cmd(
         str(output_path),
     ]
     return cmd
+
+
+def build_tiktok_cover_cmd(
+    style: BrandStyle,
+    output_path: Path,
+    title: str,
+    kicker: str = "",
+    duration_s: float = 2.0,
+) -> list:
+    """TikTok/Reels cover card — 9:16 vertical, no iris animation, no anchor.
+
+    Composition (top to bottom):
+      1. Kicker (terracotta, UPPERCASE, top third) — e.g. "LO QUE EL CLIMA OCULTA"
+      2. Big serif title — broken into 2-3 lines, center stage, ~60% of canvas
+      3. Bottom: masthead "VOZ DEL PUEBLO" with hairline accent rule
+
+    Designed to stop the scroll: high contrast, single focal point, big text.
+    Use it in voiceover_only mode in place of `build_intro_card_cmd`.
+    """
+    if not style.font_path:
+        return []
+    font = style.font_path
+    primary = style.primary_hex
+    accent = style.accent_hex
+
+    # Wrap title into <=3 lines of ~14 chars each (rough). FFmpeg drawtext
+    # doesn't auto-wrap, so we split by words greedily here.
+    words = title.strip().split()
+    lines: List[str] = []
+    cur = ""
+    max_chars = 14
+    for w in words:
+        candidate = (cur + " " + w).strip()
+        if len(candidate) > max_chars and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = candidate
+        if len(lines) >= 2:
+            # Cram remainder into the last line
+            cur = (cur + " " + " ".join(words[words.index(w) + 1:])).strip()
+            break
+    if cur:
+        lines.append(cur)
+    lines = lines[:3]
+    kicker_safe = escape_drawtext_text(kicker.upper()[:38]) if kicker else ""
+    title_lines_safe = [escape_drawtext_text(l[:30]) for l in lines]
+    name = escape_drawtext_text(style.newsroom_name)
+
+    # Vertical-friendly sizes (1080×1920). For horizontal, scale down.
+    if style.is_vertical:
+        kicker_fs = 36
+        kicker_y = "h/4-60"
+        title_fs = 110
+        title_y_start_n = "h/2-{n}*120"   # adjusted per line below
+        title_line_h = 120
+        masthead_fs = 44
+        masthead_y = "h-260"
+        accent_y = "h-180"
+        accent_w = 240
+    else:
+        kicker_fs = 24
+        kicker_y = "h/4"
+        title_fs = 72
+        title_line_h = 80
+        masthead_fs = 36
+        masthead_y = "h-180"
+        accent_y = "h-130"
+        accent_w = 240
+
+    # Build the drawtext layers for each title line (centered, stacked).
+    title_layers: List[str] = []
+    line_count = len(title_lines_safe)
+    # Center the stack vertically around h/2.
+    start_offset = -(line_count - 1) * title_line_h // 2
+    for i, line_text in enumerate(title_lines_safe):
+        y_expr = f"(h/2)+({start_offset + i * title_line_h})"
+        title_layers.append(
+            f"drawtext=fontfile='{font}':text='{line_text}':"
+            f"x=(w-text_w)/2:y={y_expr}:fontsize={title_fs}:fontcolor=white"
+        )
+
+    layers = [
+        # Black background — clean, no gradient — TikTok-cover look
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill",
+        # Kicker
+        *([
+            f"drawtext=fontfile='{font}':text='{kicker_safe}':"
+            f"x=(w-text_w)/2:y={kicker_y}:fontsize={kicker_fs}:"
+            f"fontcolor=0x{accent}"
+        ] if kicker_safe else []),
+        # Title lines (stacked)
+        *title_layers,
+        # Hairline rule above masthead
+        f"drawbox=x=(iw/2)-{accent_w//2}:y={accent_y}:w={accent_w}:h=4:"
+        f"color=0x{accent}:t=fill",
+        # Masthead at bottom
+        f"drawtext=fontfile='{font}':text='{name}':"
+        f"x=(w-text_w)/2:y={masthead_y}:fontsize={masthead_fs}:"
+        f"fontcolor=0xCCCCCC",
+    ]
+    content_vf = ",".join(layers)
+
+    from video_compositor import FFMPEG_BIN
+
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-f", "lavfi", "-t", f"{duration_s}",
+        "-i", f"color=c=black:s={style.width}x{style.height}:r={style.fps}",
+        "-f", "lavfi", "-t", f"{duration_s}",
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-filter_complex",
+        # Apply layers to the video stream, then short fade-in (300ms).
+        f"[0:v]{content_vf},fade=t=in:st=0:d=0.3[v]",
+        "-map", "[v]", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-shortest",
+        str(output_path),
+    ]
+    return cmd
