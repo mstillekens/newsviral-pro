@@ -115,6 +115,8 @@ async def main() -> int:
                         choices=[a.id for a in ANCHORS],
                         help="Force a specific anchor (default = classifier picks)")
     parser.add_argument("--mock", action="store_true")
+    parser.add_argument("--lipsync", action="store_true",
+                        help="Aplica Wav2Lip a las escenas con ancla (~+\$0.10/video)")
     args = parser.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -170,6 +172,7 @@ async def main() -> int:
         api_token=os.environ["REPLICATE_API_TOKEN"],
         skip_replicate=args.mock,
         enable_video=True,
+        enable_lip_sync=args.lipsync,
     ))
     elementos = await orch.orchestrate_parallel(prompts)
     if not await orch.validate_outputs(elementos):

@@ -53,6 +53,15 @@ class ReplicateConfig:
     video_resolution: str = "1080p"
     video_aspect_ratio: str = "16:9"   # keep horizontal for now; 9:16 is a v2 flag
 
+    # Phase 12: lip-sync (Wav2Lip via devxpy/cog-wav2lip)
+    # Only applied to anchor scenes (those with anchor_portrait_url). Scene 2
+    # (the event) doesn't have a person to sync. ~$0.05 per call → ~$0.10
+    # extra per video. Off by default until confirmed not-uncanny on this
+    # specific anchor portrait + style combination.
+    enable_lip_sync: bool = False
+    lip_sync_model: str = "devxpy/cog-wav2lip"
+    timeout_lip_sync_min: int = 8
+
 
 class RateLimiter:
     """Simple rate limiter for API calls."""
@@ -316,6 +325,170 @@ class ReplicateOrchestrator:
                 else:
                     raise
 
+    # ----- LIP-SYNC (Wav2Lip) -----
+
+    async def _lipsync_single(
+        self, video_url: str, audio_url: str, index: int
+    ) -> str:
+        """Run Wav2Lip on a single (video, audio) pair. Returns local mp4 path.
+
+        Wav2Lip preserves the original video EXCEPT for the mouth/jaw region,
+        which it re-renders frame-by-frame to match the audio's phonemes.
+        Result: the anchor's mouth actually moves with the words.
+
+        Sensible only for scenes that show a face talking. We invoke this
+        only from `apply_lipsync_to_anchor_scenes` which already filters.
+        """
+        rl_retries = 0
+        attempt = 0
+        while attempt < self.config.max_retries:
+            try:
+                await self.rate_limiter.acquire()
+                logger.info(f"👄 [LIPSYNC-{index+1}] Wav2Lip (try {attempt+1}/{self.config.max_retries})")
+
+                if self.config.skip_replicate:
+                    mock = self.output_dir / f"lipsync_{index+1}_mock.mp4"
+                    mock.touch()
+                    return str(mock)
+
+                output = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.run,
+                        self.config.lip_sync_model,
+                        input={
+                            "face": video_url,
+                            "audio": audio_url,
+                            "smooth": True,
+                            "pads": "0 10 0 0",
+                            "fps": 30,
+                        },
+                    ),
+                    timeout=self.config.timeout_lip_sync_min * 60 + 30,
+                )
+                url = str(output)
+                logger.info(f"✅ [LIPSYNC-{index+1}] mp4 URL ready")
+                local = await self._download_file(url, f"lipsync_{index+1}.mp4")
+                return str(local)
+
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱  [LIPSYNC-{index+1}] Timeout (try {attempt+1})")
+                attempt += 1
+                if attempt < self.config.max_retries:
+                    await asyncio.sleep(min(2 ** attempt, 60))
+                else:
+                    raise
+            except Exception as e:
+                if _is_rate_limit_error(e):
+                    rl_retries += 1
+                    if rl_retries > 10:
+                        raise
+                    await _backoff_for_rate_limit(f"LIPSYNC-{index+1}", rl_retries)
+                    continue
+                logger.error(f"❌ [LIPSYNC-{index+1}] {e}")
+                attempt += 1
+                if attempt < self.config.max_retries:
+                    await asyncio.sleep(min(2 ** attempt, 60))
+                else:
+                    raise
+
+    async def apply_lipsync_to_anchor_scenes(
+        self,
+        videos: Dict[str, str],
+        audios: Dict[str, str],
+        is_anchor_scene: List[bool],
+    ) -> Dict[str, str]:
+        """For each scene marked anchor=True, replace the Seedance clip with
+        a Wav2Lip'd version that has mouth motion matching the audio.
+
+        We upload the local video + audio files (the Replicate SDK handles
+        the upload automatically when you pass file paths). For non-anchor
+        scenes we leave the original Seedance clip untouched.
+
+        Returns a new dict with the same keys; anchor scenes now point at
+        the lip-synced mp4, non-anchor scenes at the original Seedance mp4.
+        """
+        out: Dict[str, str] = dict(videos)
+        keys = sorted(videos.keys())
+        targets = []
+        for i, key in enumerate(keys):
+            if i < len(is_anchor_scene) and is_anchor_scene[i]:
+                targets.append((i, key))
+
+        if not targets:
+            return out
+
+        logger.info(f"👄 Lip-sync: {len(targets)} anchor scene(s)")
+        tasks = []
+        for i, key in targets:
+            video_path = videos.get(key)
+            audio_path = audios.get(key)
+            if not video_path or not audio_path:
+                continue
+            # devxpy/cog-wav2lip accepts file handles or URLs. Open the local
+            # files so the SDK uploads them.
+            tasks.append((key, self._lipsync_with_local_files(video_path, audio_path, i)))
+
+        results = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
+        for (key, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                logger.error(f"❌ lip-sync {key}: {result} — keeping original Seedance clip")
+                continue
+            out[key] = result
+        return out
+
+    async def _lipsync_with_local_files(
+        self, video_path: str, audio_path: str, index: int
+    ) -> str:
+        """Wrap _lipsync_single but pass local file paths (which the SDK
+        will upload to Replicate). For Wav2Lip we need both face video and
+        audio reachable from Replicate's servers, so we let the SDK upload."""
+        for attempt in range(self.config.max_retries):
+            try:
+                await self.rate_limiter.acquire()
+                logger.info(f"👄 [LIPSYNC-{index+1}] Wav2Lip (upload+sync, try {attempt+1})")
+
+                if self.config.skip_replicate:
+                    mock = self.output_dir / f"lipsync_{index+1}_mock.mp4"
+                    mock.touch()
+                    return str(mock)
+
+                with open(video_path, "rb") as fv, open(audio_path, "rb") as fa:
+                    output = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.client.run,
+                            self.config.lip_sync_model,
+                            input={
+                                "face": fv,
+                                "audio": fa,
+                                "smooth": True,
+                                "pads": "0 10 0 0",
+                                "fps": 30,
+                            },
+                        ),
+                        timeout=self.config.timeout_lip_sync_min * 60 + 30,
+                    )
+                url = str(output)
+                logger.info(f"✅ [LIPSYNC-{index+1}] mp4 URL ready")
+                local = await self._download_file(url, f"lipsync_{index+1}.mp4")
+                return str(local)
+
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱  [LIPSYNC-{index+1}] Timeout (try {attempt+1})")
+                if attempt < self.config.max_retries - 1:
+                    await asyncio.sleep(min(2 ** attempt, 60))
+                else:
+                    raise
+            except Exception as e:
+                if _is_rate_limit_error(e):
+                    await _backoff_for_rate_limit(f"LIPSYNC-{index+1}", attempt + 1)
+                    continue
+                logger.error(f"❌ [LIPSYNC-{index+1}] {e}")
+                if attempt < self.config.max_retries - 1:
+                    await asyncio.sleep(min(2 ** attempt, 60))
+                else:
+                    raise
+
+
     async def generate_video_batch(
         self,
         image_urls: Dict[str, str],
@@ -503,12 +676,27 @@ class ReplicateOrchestrator:
             )
             videos = await self.generate_video_batch(image_urls, motion_prompts)
             images: Dict[str, str] = {}  # not needed; compositor uses videos
+
+            # Lip-sync pass: replace anchor scenes' Seedance clips with
+            # Wav2Lip-synchronized versions. Non-anchor scenes (event-only)
+            # are skipped because there's nobody talking to camera there.
+            if self.config.enable_lip_sync:
+                # Need audios to be ready before we can sync.
+                audios_local = await audios_task
+                is_anchor = [bool(u) for u in anchor_portrait_urls]
+                videos = await self.apply_lipsync_to_anchor_scenes(
+                    videos, audios_local, is_anchor
+                )
+                # Stash so the post-await below doesn't try to await twice.
+                audios = audios_local
+                audios_task = None  # marker so we skip the await below
         else:
             # Original Phase 2 path: download images, no Seedance.
             images = await self.generate_image_batch(image_prompts)
             videos = {}
 
-        audios = await audios_task
+        if audios_task is not None:
+            audios = await audios_task
         elapsed = (datetime.now() - start).total_seconds() / 60
 
         n_scenes = len(image_prompts)

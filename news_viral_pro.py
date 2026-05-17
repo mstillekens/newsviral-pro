@@ -131,6 +131,7 @@ class ConfigPro:
     script_model: str = "claude-haiku-4-5"
     enable_video: bool = True               # True = Seedance image→video; False = stills only
     style: str = "documentary"              # one of STYLE_VARIANTS keys
+    enable_lip_sync: bool = False           # Wav2Lip on anchor scenes (~+$0.10/video)
 
 
 # ---------- Tareas 1-3: news → script ----------
@@ -268,6 +269,7 @@ async def tarea_4_replicate_pro(
             api_token=config.replicate_api_token or os.getenv("REPLICATE_API_TOKEN", ""),
             skip_replicate=skip_replicate,
             enable_video=config.enable_video,
+            enable_lip_sync=config.enable_lip_sync,
         )
         orchestrator = ReplicateOrchestrator(replicate_config)
         elementos = await orchestrator.orchestrate_parallel(prompts, config)
@@ -477,6 +479,8 @@ def main() -> None:
     p.add_argument("--style", default="documentary",
                    choices=list(STYLE_VARIANTS.keys()),
                    help="Visual style variant for FLUX + Seedance prompts")
+    p.add_argument("--lipsync", action="store_true",
+                   help="Apply Wav2Lip to anchor scenes (~+\$0.10/video). Off by default.")
     args = p.parse_args()
 
     config = ConfigPro(
@@ -489,6 +493,7 @@ def main() -> None:
         script_model=args.model,
         enable_video=not args.no_video,
         style=args.style,
+        enable_lip_sync=args.lipsync,
     )
 
     if not config.anthropic_api_key and not args.mock:
