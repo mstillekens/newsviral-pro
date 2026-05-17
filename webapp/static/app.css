@@ -173,6 +173,101 @@ p { margin: 6px 0; }
 }
 .refresh button:active { transform: scale(0.98); background: var(--ink-2); }
 
+/* ---------- Settings panel ---------- */
+
+.settings {
+  background: var(--surface);
+  border-radius: var(--r-card);
+  padding: 14px 18px;
+  margin-bottom: 18px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+.settings summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--ink);
+}
+.settings summary::-webkit-details-marker { display: none; }
+.settings-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.tag {
+  background: var(--surface-2);
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+}
+.tag.on {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+.settings-form {
+  margin-top: 14px;
+  display: grid;
+  gap: 12px;
+}
+.settings-form label {
+  display: block;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.settings-form select {
+  margin-top: 6px;
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: var(--r-inner);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-size: 15px;
+  font-family: inherit;
+  color: var(--ink);
+}
+.settings-form .toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: var(--surface-2);
+  padding: 12px 14px;
+  border-radius: var(--r-inner);
+  cursor: pointer;
+}
+.settings-form .toggle input {
+  margin-top: 2px;
+  width: 20px;
+  height: 20px;
+  accent-color: var(--primary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.settings-form .toggle span {
+  flex: 1;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.settings-form button {
+  background: var(--primary);
+  color: white;
+  border: 0;
+  padding: 14px;
+  font-size: 15px;
+  font-weight: 600;
+  border-radius: var(--r-inner);
+  cursor: pointer;
+}
+.settings-form button:active { transform: scale(0.98); }
+
 /* ---------- News cards ---------- */
 
 .cards { display: grid; gap: 14px; }

@@ -51,7 +51,7 @@ from script_writer import ScriptWriter
 from replicate_orchestrator import ReplicateConfig, ReplicateOrchestrator
 from video_compositor import BrandingConfig, VideoCompositor
 from run_logger import RunLogger
-from brand_style import STYLE_VARIANTS, ANCHORS, anchor_for
+from brand_style import STYLE_VARIANTS, ANCHORS, anchor_for, pick_voice_id_for
 
 
 logging.basicConfig(
@@ -127,6 +127,34 @@ def update_state(mutator) -> Dict[str, Any]:
 GEN_LOCK = asyncio.Lock()  # serialize Replicate-heavy work
 
 
+def _env_flag(key: str) -> bool:
+    """Read a boolean-ish env var. Accepts 1/true/yes/on (case-insensitive)."""
+    return os.environ.get(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_default_style() -> str:
+    return os.environ.get("WEBAPP_STYLE", "caricature")
+
+
+def _inject_anchor_portrait_for(prompts: Dict[str, Any], anchor_id: str) -> None:
+    """Attach the cached portrait URL to scenes 1 and 3 so FLUX gets skipped
+    for the anchor scenes and the character stays visually consistent."""
+    path = ROOT / "anchor_portraits" / "manifest.json"
+    if not path.exists():
+        return
+    try:
+        manifest = json.loads(path.read_text())
+    except Exception:
+        return
+    entry = manifest.get(anchor_id)
+    url = (entry or {}).get("url")
+    if not url:
+        return
+    for key in ("escena_1", "escena_3"):
+        if key in prompts and isinstance(prompts[key], dict):
+            prompts[key]["anchor_portrait_url"] = url
+
+
 async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
     """Run script → Replicate → compose for one news item."""
     item = NewsItem(**{k: v for k, v in item_dict.items() if k in NewsItem.__dataclass_fields__})
@@ -136,33 +164,51 @@ async def run_video_pipeline(job_id: str, item_dict: Dict[str, Any]) -> None:
         s["jobs"][job_id]["started"] = datetime.now().isoformat()
     update_state(mark_started)
 
+    # Per-job options — read at job dispatch time so the user can change them
+    # via the webapp settings form (or .env) and the very next job picks up
+    # the new values without restarting the service.
+    opts = item_dict.get("_options", {}) or {}
+    style_name = (opts.get("style") or _env_default_style()).strip() or "caricature"
+    if style_name not in STYLE_VARIANTS:
+        style_name = "caricature"
+    use_lipsync = bool(opts.get("lipsync", _env_flag("WEBAPP_LIPSYNC")))
+    use_vertical = bool(opts.get("vertical", _env_flag("WEBAPP_VERTICAL")))
+
     async with GEN_LOCK:
         try:
             anchor = anchor_for(f"{item.title}\n{item.snippet}\n{item.body}")
-            writer = ScriptWriter(model="claude-haiku-4-5", style="caricature")
+            writer = ScriptWriter(model="claude-haiku-4-5", style=style_name)
             script = await asyncio.to_thread(writer.write, item, anchor)
 
             prompts = dict(script.scenes)
+            # Anchor portrait → scenes 1 and 3 (kept consistent across runs).
+            _inject_anchor_portrait_for(prompts, anchor.id)
+
             # ref-image enrichment for scene 2
             if "escena_2" in prompts and item.url:
                 ref = await asyncio.to_thread(find_reference_image, item.url)
                 if ref:
                     prompts["escena_2"]["reference_image_url"] = ref.url
 
-            vid = os.environ.get("MINIMAX_VOICE_ID", "")
-            if vid:
-                prompts["voice_params"] = {"voice_id": vid, "language_boost": "Spanish"}
+            # Gender-matched voice (with optional cloned override).
+            voice_id = pick_voice_id_for(anchor, dict(os.environ))
+            prompts["voice_params"] = {"voice_id": voice_id, "language_boost": "Spanish"}
 
             orch = ReplicateOrchestrator(ReplicateConfig(
                 api_token=os.environ["REPLICATE_API_TOKEN"],
                 enable_video=True,
+                enable_lip_sync=use_lipsync,
+                video_aspect_ratio="9:16" if use_vertical else "16:9",
             ))
             elementos = await orch.orchestrate_parallel(prompts)
             if not await orch.validate_outputs(elementos):
                 raise RuntimeError("validate_outputs failed")
 
             compositor = VideoCompositor(
-                BrandingConfig(colors={"primary": "#235B4E", "accent": "#9F2241", "bg": "#000000"}),
+                BrandingConfig(
+                    colors={"primary": "#235B4E", "accent": "#9F2241", "bg": "#000000"},
+                    vertical=use_vertical,
+                ),
                 news_title=item.title,
                 news_source=item.source,
                 anchor=anchor,
@@ -272,6 +318,8 @@ async def index(request: Request, _: None = Depends(require_auth)):
     decisions = state.get("decisions", {})
     # Show only items the user hasn't decided on yet.
     pending = [i for i in items if i["url"] not in decisions]
+    # Current generation settings — read from session state with env fallback.
+    settings = state.get("settings", {}) or {}
     return templates.TemplateResponse("index.html", {
         "request": request,
         "pending": pending,
@@ -279,7 +327,31 @@ async def index(request: Request, _: None = Depends(require_auth)):
         "decided": len(decisions),
         "queue_size": sum(1 for j in state.get("jobs", {}).values() if j["status"] in ("queued", "running")),
         "videos_ready": sum(1 for j in state.get("jobs", {}).values() if j["status"] == "done"),
+        "style_options": list(STYLE_VARIANTS.keys()),
+        "current_style": settings.get("style", _env_default_style()),
+        "current_lipsync": settings.get("lipsync", _env_flag("WEBAPP_LIPSYNC")),
+        "current_vertical": settings.get("vertical", _env_flag("WEBAPP_VERTICAL")),
     })
+
+
+@app.post("/settings", response_class=RedirectResponse)
+async def update_settings(
+    request: Request,
+    _: None = Depends(require_auth),
+    style: str = Form("caricature"),
+    lipsync: str = Form(""),    # "on" or ""
+    vertical: str = Form(""),
+):
+    """Persist generation settings so subsequent /decide calls pick them up."""
+    new_style = style if style in STYLE_VARIANTS else "caricature"
+    def mut(state):
+        state["settings"] = {
+            "style": new_style,
+            "lipsync": lipsync == "on",
+            "vertical": vertical == "on",
+        }
+    update_state(mut)
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/refresh", response_class=RedirectResponse)
@@ -334,6 +406,14 @@ async def decide(
 
     if accepted:
         job_id = uuid.uuid4().hex[:10]
+        # Snapshot the user's current settings so this specific job uses them
+        # even if the user toggles them between dispatching and execution.
+        current_settings = state.get("settings", {}) or {}
+        item_with_opts = {**item_data, "_options": {
+            "style": current_settings.get("style", _env_default_style()),
+            "lipsync": current_settings.get("lipsync", _env_flag("WEBAPP_LIPSYNC")),
+            "vertical": current_settings.get("vertical", _env_flag("WEBAPP_VERTICAL")),
+        }}
 
         def mut_with_job(s):
             mut(s)
@@ -347,13 +427,14 @@ async def decide(
                 "started": None,
                 "finished": None,
                 "created": datetime.now().isoformat(),
+                "options": item_with_opts["_options"],
             }
             s["job_order"].insert(0, job_id)
         update_state(mut_with_job)
 
         # Fire-and-forget background job. The asyncio lock inside ensures only
         # one heavy job runs at a time.
-        background_tasks.add_task(run_video_pipeline, job_id, item_data)
+        background_tasks.add_task(run_video_pipeline, job_id, item_with_opts)
     else:
         update_state(mut)
 

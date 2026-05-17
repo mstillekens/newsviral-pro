@@ -13,6 +13,36 @@
   <button type="submit">↻ Refrescar noticias QR</button>
 </form>
 
+<details class="settings">
+  <summary>
+    ⚙️ Ajustes del video
+    <span class="settings-tags">
+      <span class="tag">{{ current_style }}</span>
+      {% if current_lipsync %}<span class="tag on">lip-sync</span>{% endif %}
+      {% if current_vertical %}<span class="tag on">9:16</span>{% endif %}
+    </span>
+  </summary>
+  <form action="/settings" method="post" class="settings-form">
+    <label>Estilo visual
+      <select name="style">
+        {% for s in style_options %}
+        <option value="{{ s }}" {% if s == current_style %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" name="lipsync" value="on" {% if current_lipsync %}checked{% endif %}>
+      <span>Lip-sync (+$0.10/video) — boca se mueve con la voz</span>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" name="vertical" value="on" {% if current_vertical %}checked{% endif %}>
+      <span>Vertical 9:16 — para Reels/TikTok/celular</span>
+    </label>
+    <button type="submit">Guardar ajustes</button>
+    <p class="hint">Los próximos videos que generes usarán estos ajustes.</p>
+  </form>
+</details>
+
 {% if not pending %}
   <p class="empty">No hay noticias pendientes.<br>Refresca arriba para traer las del día.</p>
 {% endif %}
