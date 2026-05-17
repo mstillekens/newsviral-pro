@@ -18,6 +18,9 @@
       <a href="/" {% if request.url.path == '/' %}class="active"{% endif %}>Noticias</a>
       <a href="/queue" {% if request.url.path == '/queue' %}class="active"{% endif %}>Cola</a>
       <a href="/videos" {% if request.url.path == '/videos' %}class="active"{% endif %}>Videos</a>
+      {% if request.app.state.dev_mode %}
+        <a href="/filtered" {% if request.url.path == '/filtered' %}class="active"{% endif %}>Filtradas</a>
+      {% endif %}
     </nav>
   </header>
   <main>

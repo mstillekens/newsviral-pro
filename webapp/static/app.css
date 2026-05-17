@@ -448,6 +448,129 @@ p { margin: 6px 0; }
 }
 .alt-sources a:hover { text-decoration: underline; }
 
+/* ---------- /filtered audit view (dev) ---------- */
+
+.filter-header h1 {
+  margin: 4px 0 6px;
+  font-size: 24px;
+  letter-spacing: -0.01em;
+}
+.filter-header .hint .badge { margin-left: 4px; }
+
+.filter-breakdown {
+  background: var(--surface);
+  border-radius: var(--r-card);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--border);
+  margin: 14px 0;
+}
+.filter-breakdown h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.kv {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.kv li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface-2);
+  padding: 6px 12px;
+  border-radius: var(--r-pill);
+  font-size: 13px;
+}
+.kv-k { color: var(--ink-2); font-weight: 500; }
+.kv-v { color: var(--ink); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+.filter-list { margin: 18px 0; }
+.filter-list h3 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+}
+.filtered-items {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+}
+.filtered-item {
+  background: var(--surface);
+  border-radius: var(--r-inner);
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+.filtered-item.verdict-block { border-left: 3px solid var(--bad); }
+.filtered-item.verdict-review { border-left: 3px solid var(--warn); }
+.fi-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+.fi-cat, .fi-conf, .fi-decided {
+  background: var(--surface-2);
+  color: var(--ink-2);
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}
+.fi-title {
+  font-weight: 600;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.3;
+  margin: 4px 0;
+}
+.fi-reason {
+  color: var(--ink-2);
+  font-size: 13px;
+  font-style: italic;
+}
+.fi-keywords {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.fi-keywords .kw {
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  font-weight: 600;
+}
+.filtered-item.verdict-review .fi-keywords .kw {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.fi-url {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--ink-3);
+  word-break: break-all;
+}
+.fi-url:hover { color: var(--primary); }
+
 .job-anchor, .job-source, .job-status, .job-error {
   font-size: 14px;
   color: var(--ink-2);

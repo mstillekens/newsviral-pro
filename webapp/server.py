@@ -59,6 +59,14 @@ from news_enrichment import (
     EnrichmentConfig,
     EnrichmentError,
 )
+from political_filter import (
+    PoliticalFilter,
+    PoliticalFilterConfig,
+    FilterStats,
+    ItemSummary,
+    apply_filter_to_clusters,
+    DEFAULT_RULES_PATH as POLITICAL_RULES_PATH,
+)
 
 
 logging.basicConfig(
@@ -111,6 +119,10 @@ if _MISSING_KEYS:
         f"'Generar' will fail until these are set. "
         f"Add them to {ROOT}/.env or the parent repo .env"
     )
+
+# Dev mode toggle — exposes /filtered audit tab and richer endpoints.
+WEBAPP_DEV_MODE = (os.environ.get("WEBAPP_DEV_MODE", "").strip().lower()
+                   in ("1", "true", "yes", "on"))
 
 
 # ---------- State (one user, no DB needed) ----------
@@ -397,8 +409,54 @@ def require_auth(request: Request) -> None:
 # ---------- App ----------
 
 app = FastAPI(title="VOZ DEL PUEBLO")
+app.state.dev_mode = WEBAPP_DEV_MODE
 templates = Jinja2Templates(directory=str(ROOT / "webapp" / "templates"))
 app.mount("/static", StaticFiles(directory=str(ROOT / "webapp" / "static")), name="static")
+
+
+# ---------- Political filter (lazy singleton) ----------
+#
+# We don't instantiate this at import time because it needs the Anthropic
+# client (which fails loudly if ANTHROPIC_API_KEY isn't set). Lazy init lets
+# the rest of the app run for users who only browse /videos.
+
+_POLITICAL_FILTER: Optional[PoliticalFilter] = None
+_LAST_FILTER_STATS: Optional[FilterStats] = None
+FILTER_CACHE_PATH = ROOT / "webapp" / "political_cache.json"
+
+
+def _get_political_filter() -> Optional[PoliticalFilter]:
+    """Construct (once) the PoliticalFilter. Returns None if disabled or
+    if Anthropic isn't configured — caller treats None as a no-op."""
+    global _POLITICAL_FILTER
+    cfg = PoliticalFilterConfig.from_env()
+    if not cfg.enabled or cfg.mode == "off":
+        return None
+    if _POLITICAL_FILTER is not None:
+        return _POLITICAL_FILTER
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.info(
+            "political_filter: ANTHROPIC_API_KEY not set, running in keyword-only mode"
+        )
+    try:
+        from anthropic import Anthropic
+        # If no key, we still build the filter — keyword fast-path works and
+        # LLM batch falls back to allow with `decided_by=fallback`.
+        client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY") or "missing")
+        _POLITICAL_FILTER = PoliticalFilter(
+            client,
+            rules_path=POLITICAL_RULES_PATH,
+            cache_path=FILTER_CACHE_PATH,
+            config=cfg,
+        )
+        logger.info(
+            f"political_filter: enabled mode={cfg.mode} model={cfg.model} "
+            f"threshold={cfg.confidence_threshold}"
+        )
+    except Exception as e:
+        logger.warning(f"political_filter init failed: {e}")
+        return None
+    return _POLITICAL_FILTER
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -472,6 +530,33 @@ async def refresh(_: None = Depends(require_auth)):
     except Exception as e:
         logger.warning(f"aggregator failed, falling back to RSS: {e}")
 
+    # Political/content filter: drops clusters that would trigger AI moderation,
+    # caps borderline ones to a sub-MIN_SCORE so they don't reach the dashboard.
+    # Runs AFTER dedupe (aggregator did that) and BEFORE final scoring (next).
+    global _LAST_FILTER_STATS
+    stats = FilterStats(timestamp=datetime.now().isoformat())
+    pfilter = _get_political_filter() if clusters else None
+    if pfilter is not None and clusters:
+        items_for_filter = [
+            ItemSummary(
+                url=c.primary.url, title=c.primary.title,
+                snippet=c.primary.snippet or "",
+                outlet=c.primary.outlet,
+            ) for c in clusters
+        ]
+        try:
+            decisions = await pfilter.batch_filter(items_for_filter)
+        except Exception as e:
+            logger.warning(f"political_filter batch failed, allowing all: {e}")
+            decisions = {}
+        before = len(clusters)
+        clusters = apply_filter_to_clusters(clusters, decisions, stats=stats)
+        logger.info(
+            f"political_filter: blocked={stats.blocked} review={stats.review} "
+            f"allowed={stats.allowed} (in={before} → out={len(clusters)})"
+        )
+    _LAST_FILTER_STATS = stats
+
     weights = load_weights()
     items_for_scoring: List[NewsItem] = []
     cluster_by_url: Dict[str, NewsCluster] = {}
@@ -507,6 +592,18 @@ async def refresh(_: None = Depends(require_auth)):
             boost = min(0.20, 0.05 * (c.source_count - 1))
             s.score = min(1.0, s.score + boost)
             s.breakdown["multi_source"] = round(boost, 3)
+
+    # Apply political_filter score caps for REVIEW items: their float score
+    # is forced down to (cap / 100), so the hard filter below drops them.
+    # Tracked in breakdown for audit.
+    for s in scored:
+        c = cluster_by_url.get(s.item.url)
+        cap = getattr(c, "_score_cap", None) if c else None
+        if cap is not None:
+            new = min(s.score, cap / 100.0)
+            if new < s.score:
+                s.breakdown["political_review_cap"] = round(new - s.score, 3)
+                s.score = new
 
     # M1 hard filter: drop anything below 60/100 — these don't make the cut.
     MIN_SCORE = 60
@@ -747,3 +844,40 @@ Para precios reales en tu cuenta, revisa <a href="https://replicate.com/account/
 <p><a href="/">← Volver</a></p>
 </body></html>"""
     return HTMLResponse(html)
+
+
+@app.get("/api/political-stats")
+async def political_stats_json(_: None = Depends(require_auth)):
+    """Last-run filter audit. Always available so a dashboard can poll it."""
+    cfg = PoliticalFilterConfig.from_env()
+    payload: Dict[str, Any] = {
+        "enabled": cfg.enabled and cfg.mode != "off",
+        "mode": cfg.mode,
+        "model": cfg.model,
+        "confidence_threshold": cfg.confidence_threshold,
+        "dev_mode": WEBAPP_DEV_MODE,
+        "last_run": _LAST_FILTER_STATS.to_dict() if _LAST_FILTER_STATS else None,
+    }
+    return JSONResponse(payload)
+
+
+@app.get("/filtered", response_class=HTMLResponse)
+async def filtered_view(request: Request, _: None = Depends(require_auth)):
+    """Dev-only audit view of items that the political filter dropped or
+    sent to review on the last /refresh. Gated by WEBAPP_DEV_MODE."""
+    if not WEBAPP_DEV_MODE:
+        raise HTTPException(
+            status_code=404,
+            detail="enable WEBAPP_DEV_MODE=true in .env to use /filtered",
+        )
+    cfg = PoliticalFilterConfig.from_env()
+    return templates.TemplateResponse("filtered.html", {
+        "request": request,
+        "stats": _LAST_FILTER_STATS,
+        "config": {
+            "enabled": cfg.enabled and cfg.mode != "off",
+            "mode": cfg.mode,
+            "model": cfg.model,
+            "confidence_threshold": cfg.confidence_threshold,
+        },
+    })

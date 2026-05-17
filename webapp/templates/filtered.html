@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Filtradas · VOZ DEL PUEBLO{% endblock %}
+{% block content %}
+
+<section class="filter-header">
+  <h1>Filtradas — auditoría del filtro de contenido</h1>
+  <p class="hint">
+    Modo <strong>{{ config.mode }}</strong> ·
+    Modelo {{ config.model }} ·
+    Umbral confidence {{ config.confidence_threshold }} ·
+    {% if config.enabled %}<span class="badge done">ENABLED</span>{% else %}<span class="badge failed">DISABLED</span>{% endif %}
+  </p>
+</section>
+
+{% if not stats %}
+  <p class="empty">Aún no hay datos. Presiona "↻ Refrescar noticias QR" en la pestaña Noticias y vuelve aquí.</p>
+{% else %}
+<section class="stats">
+  <div><strong>{{ stats.blocked }}</strong><span>bloqueadas</span></div>
+  <div><strong>{{ stats.review }}</strong><span>en revisión</span></div>
+  <div><strong>{{ stats.allowed }}</strong><span>permitidas</span></div>
+  <div><strong>{{ stats.total }}</strong><span>total</span></div>
+</section>
+
+{% if stats.by_decided_by %}
+<section class="filter-breakdown">
+  <h3>Por método</h3>
+  <ul class="kv">
+    {% for k, v in stats.by_decided_by.items() %}
+      <li><span class="kv-k">{{ k }}</span><span class="kv-v">{{ v }}</span></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if stats.by_category %}
+<section class="filter-breakdown">
+  <h3>Por categoría</h3>
+  <ul class="kv">
+    {% for k, v in stats.by_category.items() %}
+      <li><span class="kv-k">{{ k }}</span><span class="kv-v">{{ v }}</span></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if stats.sample_blocked %}
+<section class="filter-list">
+  <h3>Bloqueadas ({{ stats.sample_blocked|length }} muestra)</h3>
+  <ul class="filtered-items">
+    {% for it in stats.sample_blocked %}
+    <li class="filtered-item verdict-block">
+      <div class="fi-head">
+        <span class="badge failed">BLOCK</span>
+        <span class="fi-cat">{{ it.category }}</span>
+        <span class="fi-conf">conf {{ it.confidence }}</span>
+        <span class="fi-decided">{{ it.decided_by }}</span>
+      </div>
+      <div class="fi-title">{{ it.title }}</div>
+      <div class="fi-reason">{{ it.reason }}</div>
+      {% if it.matched_keywords %}
+        <div class="fi-keywords">
+          {% for k in it.matched_keywords %}<span class="kw">{{ k }}</span>{% endfor %}
+        </div>
+      {% endif %}
+      <a class="fi-url" href="{{ it.url }}" target="_blank" rel="noopener">{{ it.url[:120] }}</a>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% if stats.sample_review %}
+<section class="filter-list">
+  <h3>En revisión ({{ stats.sample_review|length }} muestra)</h3>
+  <ul class="filtered-items">
+    {% for it in stats.sample_review %}
+    <li class="filtered-item verdict-review">
+      <div class="fi-head">
+        <span class="badge queued">REVIEW</span>
+        <span class="fi-cat">{{ it.category }}</span>
+        <span class="fi-conf">conf {{ it.confidence }}</span>
+        <span class="fi-decided">{{ it.decided_by }}</span>
+      </div>
+      <div class="fi-title">{{ it.title }}</div>
+      <div class="fi-reason">{{ it.reason }}</div>
+      {% if it.matched_keywords %}
+        <div class="fi-keywords">
+          {% for k in it.matched_keywords %}<span class="kw">{{ k }}</span>{% endfor %}
+        </div>
+      {% endif %}
+      <a class="fi-url" href="{{ it.url }}" target="_blank" rel="noopener">{{ it.url[:120] }}</a>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+{% endif %}
+
+{% endblock %}

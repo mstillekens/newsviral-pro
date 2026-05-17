@@ -1,0 +1,155 @@
+# Política de filtrado de contenido sensible para evitar rechazos del
+# modelo de video (Bytedance Seedance) y otros proveedores.
+#
+# IMPORTANTE: este filtro NO es editorial. NO bloquea política per se.
+# Bloquea contenido que SABEMOS que activa moderación de modelos de AI:
+# violencia, crimen organizado, armas, capturas con elementos gráficos.
+#
+# Tres veredictos:
+#   block   — descarta totalmente, no aparece en el dashboard.
+#   review  — score capped al MIN_SCORE-1 (queda fuera del dashboard
+#             con MIN_SCORE=60 default, pero se registra para auditoría).
+#   allow   — pasa normal.
+#
+# El LLM clasifica con este YAML como hint, no como reemplazo. Una noticia
+# de "Mara Lezama abre hospital" debe pasar como `service` incluso aunque
+# contenga "Mara Lezama" (que está en la lista de hint review).
+
+block:
+  # Crimen organizado y narco — Seedance rechaza imágenes/video sobre esto.
+  narco:
+    - cartel
+    - cártel
+    - narcotráfico
+    - narcotraficante
+    - narco
+    - sinaloa
+    - jalisco nueva generación
+    - cjng
+    - hells angels
+    - capo
+    - sicario
+
+  # Violencia gráfica y armas.
+  violence:
+    - asesinato
+    - asesinado
+    - homicidio
+    - feminicidio
+    - balacera
+    - tiroteo
+    - ejecución
+    - ejecutado
+    - decapitado
+    - descuartizado
+    - tortura
+    - secuestro
+    - secuestrado
+    - extorsión
+    - levantón
+    - levantado
+    - rafagueado
+    - degollado
+    - calcinado
+
+  weapons:
+    - arma de fuego
+    - fusil
+    - rifle
+    - granada
+    - explosivo
+
+  # Capturas, operativos y enfrentamientos con elementos gráficos.
+  capturas_violentas:
+    - enfrentamiento armado
+    - operativo armado
+    - abatido
+    - detenido por homicidio
+    - prófugo
+
+  # Contenido sexual y abuso — siempre rechazado por moderación.
+  abuse:
+    - abuso sexual
+    - violación
+    - violador
+    - explotación sexual
+    - trata de personas
+    - pederastia
+    - pornografía
+    - prostitución forzada
+
+  # Drogas duras y producción.
+  drugs:
+    - fentanilo
+    - cocaína
+    - heroína
+    - laboratorio clandestino
+    - decomiso de droga
+
+  # Suicidio y autolesión — políticas de salud mental.
+  self_harm:
+    - suicidio
+    - se quitó la vida
+    - autolesión
+
+review:
+  # Conflicto social y protestas con potencial de carga ideológica.
+  conflict:
+    - manifestación violenta
+    - bloqueo
+    - protesta
+    - disturbio
+    - choque entre
+    - confrontación
+
+  # Temas sensibles que pueden tener encuadre político fuerte.
+  sensitive:
+    - migrantes
+    - migración irregular
+    - aborto
+    - eutanasia
+    - matrimonio igualitario
+    - derechos humanos violados
+
+  # Funcionarios en contexto de denuncia/escándalo (no de servicio).
+  political_friction:
+    - escándalo
+    - denuncia política
+    - acusación de corrupción
+    - desafuero
+    - juicio político
+    - destituido
+
+allow_hints:
+  # Pistas para el LLM de que una noticia ES de servicio (allow).
+  # Cuando aparecen estos términos junto a un funcionario, suele ser
+  # servicio público (apertura, anuncio, infraestructura).
+  service_topics:
+    - clima
+    - pronóstico
+    - turismo
+    - turistas
+    - hotel
+    - playa
+    - cultura
+    - festival
+    - tradición
+    - gastronomía
+    - deportes
+    - olimpiadas
+    - infraestructura
+    - obra pública
+    - hospital
+    - escuela
+    - inversión
+    - empleo
+    - feria
+    - economía local
+    - salud pública
+    - vacunación
+    - reciclaje
+    - medio ambiente
+    - movilidad
+    - transporte
+    - reforestación
+    - playa limpia
