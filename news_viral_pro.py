@@ -16,6 +16,7 @@ Everything is logged under logs/runs/<timestamp>/.
 """
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -34,6 +35,47 @@ from news_scorer import ScoredItem, load_weights, save_weights, score_items, upd
 from script_writer import Script, ScriptWriter
 from run_logger import RunLogger
 from brand_style import STYLE_VARIANTS, anchor_for
+
+
+# Lazy-load the anchor portrait manifest. The orchestrator can skip FLUX
+# for scenes that show the anchor when we have a cached portrait — gives
+# us brand-consistent characters across every video.
+_ANCHOR_MANIFEST: Optional[Dict[str, Dict[str, str]]] = None
+
+
+def _load_anchor_manifest() -> Dict[str, Dict[str, str]]:
+    global _ANCHOR_MANIFEST
+    if _ANCHOR_MANIFEST is None:
+        path = Path("anchor_portraits/manifest.json")
+        if path.exists():
+            try:
+                _ANCHOR_MANIFEST = json.loads(path.read_text())
+            except Exception:
+                _ANCHOR_MANIFEST = {}
+        else:
+            _ANCHOR_MANIFEST = {}
+    return _ANCHOR_MANIFEST
+
+
+def _inject_anchor_portraits(prompts: Dict, anchor_id: str) -> None:
+    """Attach the cached portrait URL to scenes 1 and 3 (the anchor scenes).
+
+    Convention from script_writer: escena_1 = anchor hook, escena_2 = event,
+    escena_3 = anchor close. We tag 1 and 3 with the cached portrait so the
+    orchestrator skips FLUX for them entirely. Scene 2 stays untouched so it
+    can use FLUX text-to-image (or canny+ref-image when scraped).
+    """
+    manifest = _load_anchor_manifest()
+    entry = manifest.get(anchor_id)
+    if not entry:
+        logger.warning(f"⚠️  No cached portrait for anchor {anchor_id} — run setup_anchors.py")
+        return
+    url = entry.get("url")
+    if not url:
+        return
+    for key in ("escena_1", "escena_3"):
+        if key in prompts and isinstance(prompts[key], dict):
+            prompts[key]["anchor_portrait_url"] = url
 
 
 # ---------- Logger ----------
@@ -280,6 +322,11 @@ async def produce_video_for_script(
     logger.info(f"━━━ Video #{idx}: «{news_title[:70]}» (persona={script.persona_id}) ━━━")
 
     prompts = script.to_prompts_dict()
+
+    # Anchor portrait injection. Scenes 1 and 3 always feature the anchor;
+    # using the cached portrait keeps the character visually identical
+    # across every video and skips a FLUX call per scene.
+    _inject_anchor_portraits(prompts, script.anchor_id)
 
     # Reference image enrichment for scene 2 (the "event" scene per our
     # template). If we can scrape an og:image from the news URL we pass it

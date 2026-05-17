@@ -1,0 +1,38 @@
+{
+  "don_polibruh": {
+    "anchor_id": "don_polibruh",
+    "name": "Don Polibruh",
+    "url": "https://replicate.delivery/xezq/eVfsNi2LGYthGEfet4Pmv5UF5IQd2Aozvcyy1h7abdmNNVXaB/tmp3eki3ajr.webp",
+    "local_path": "anchor_portraits/don_polibruh.jpg",
+    "style": "documentary",
+    "aspect_ratio": "16:9",
+    "prompt": "Medium close-up news anchor portrait. Mexican man in his early 40s, dark hair with grey on the sides, light beard, square wireframe glasses, a black baseball cap pushed back, wearing a dark green polo shirt with thin red trim and a small embroidered VOZ DEL PUEBLO logo on the chest, casual professional, no other visible text or logos, expressive eyebrows, mid-shot, urban Mexican neighborhood background. Looking directly at camera, calm professional expression, warm three-point lighting, soft background bokeh, 35mm lens, sharp focus on face, broadcast news aesthetic. documentary photojournalism, broadcast news aesthetic, natural Mexican light, slightly desaturated grade, no text or logos in frame"
+  },
+  "dona_chispas": {
+    "anchor_id": "dona_chispas",
+    "name": "Doña Chispas",
+    "url": "https://replicate.delivery/xezq/dbtJNdURpk5hEpKOMpUm4Tfz4BfXG3ZNs4aFi3WQHALOU1lWA/tmpp5031crh.webp",
+    "local_path": "anchor_portraits/dona_chispas.jpg",
+    "style": "documentary",
+    "aspect_ratio": "16:9",
+    "prompt": "Medium close-up news anchor portrait. Mexican woman in her late 50s, warm smile, dark hair pulled back, silver earrings, a dark green apron with a small VOZ DEL PUEBLO logo and red trim over a floral blouse, holding a small mug of coffee, sunlit Mexican courtyard with clotheslines and potted plants behind her. Looking directly at camera, calm professional expression, warm three-point lighting, soft background bokeh, 35mm lens, sharp focus on face, broadcast news aesthetic. documentary photojournalism, broadcast news aesthetic, natural Mexican light, slightly desaturated grade, no text or logos in frame"
+  },
+  "cuauh_banqueta": {
+    "anchor_id": "cuauh_banqueta",
+    "name": "El Cuauh Banqueta",
+    "url": "https://replicate.delivery/xezq/VfWSWZpCflpFukYkM2fsYnxH8UMbKlfiReVyk4eByIYgHVdpF/tmpn6lhg2mh.webp",
+    "local_path": "anchor_portraits/cuauh_banqueta.jpg",
+    "style": "documentary",
+    "aspect_ratio": "16:9",
+    "prompt": "Medium close-up news anchor portrait. Mexican man in his late 20s, fit build, short black hair with a fade, a sports cap, wearing a dark green polo shirt with thin red trim and a small embroidered VOZ DEL PUEBLO logo on the chest, casual professional, no other visible text or logos, a soccer ball tucked under his arm, a neighborhood futbol cancha with painted walls in the background. Looking directly at camera, calm professional expression, warm three-point lighting, soft background bokeh, 35mm lens, sharp focus on face, broadcast news aesthetic. documentary photojournalism, broadcast news aesthetic, natural Mexican light, slightly desaturated grade, no text or logos in frame"
+  },
+  "compa_caribe": {
+    "anchor_id": "compa_caribe",
+    "name": "El Compa Caribe",
+    "url": "https://replicate.delivery/xezq/fD22e6OrgfDbcJarTnNfoNinBtRLe0khwQEAgJneZMuzLVdpF/tmpahs1245b.webp",
+    "local_path": "anchor_portraits/compa_caribe.jpg",
+    "style": "documentary",
+    "aspect_ratio": "16:9",
+    "prompt": "Medium close-up news anchor portrait. Mexican man in his early 30s, tan skin, dark hair, slight stubble, wearing a dark green short-sleeve linen guayabera with thin red trim and a small embroidered VOZ DEL PUEBLO logo on the chest, casual professional, no other visible text or logos, Caribbean malecón behind him, palm trees, soft golden hour Cancún light. Looking directly at camera, calm professional expression, warm three-point lighting, soft background bokeh, 35mm lens, sharp focus on face, broadcast news aesthetic. documentary photojournalism, broadcast news aesthetic, natural Mexican light, slightly desaturated grade, no text or logos in frame"
+  }
+}

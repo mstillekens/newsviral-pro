@@ -37,7 +37,9 @@ class ReplicateConfig:
     """Configuration for Replicate orchestration."""
     api_token: str
     max_concurrent: int = 10
-    rate_limit_per_min: int = 50
+    rate_limit_per_min: int = 5     # Conservative default for free-tier accounts
+                                     # (<$5 credit = 1 burst / ~6 per min on Replicate).
+                                     # Override to 50+ once you've added credit.
     timeout_image_min: int = 15
     timeout_audio_min: int = 5
     timeout_video_min: int = 10
@@ -67,6 +69,20 @@ class RateLimiter:
         self.last_request = time.time()
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detect Replicate's 429 / throttled responses across SDK versions."""
+    msg = str(exc).lower()
+    return "429" in msg or "throttled" in msg or "rate limit" in msg
+
+
+async def _backoff_for_rate_limit(label: str, attempt: int) -> None:
+    """Replicate's free-tier (< $5 credit) caps at 1 burst / 6 per minute and
+    resets every ~10 seconds. Wait 13s to be safely past the reset window."""
+    wait = 13 + 3 * (attempt - 1)
+    logger.warning(f"⏳ {label} rate-limited (rl-retry {attempt}); sleeping {wait}s")
+    await asyncio.sleep(wait)
+
+
 class ReplicateOrchestrator:
     """Parallel FLUX + Seedance + MiniMax orchestrator."""
 
@@ -88,20 +104,30 @@ class ReplicateOrchestrator:
         prompt: str,
         index: int,
         reference_image_url: Optional[str] = None,
+        anchor_portrait_url: Optional[str] = None,
     ) -> str:
-        """Generate an image and return its Replicate URL (no local download).
+        """Generate (or return) an image URL for Seedance's first frame.
 
-        Two modes:
-        - reference_image_url=None → plain text-to-image via flux-pro.
-        - reference_image_url=<url> → flux-canny-pro takes the URL as
-          control_image. The edges of the reference are preserved while the
-          style is dictated by `prompt`. Used to turn real news photos into
-          on-brand caricatures that still look like the actual subjects.
+        Three modes, in priority order:
+        - anchor_portrait_url=<url> → SKIP FLUX entirely and return the
+          cached anchor portrait URL. The anchor looks the SAME in every
+          video. This is the brand-consistency win.
+        - reference_image_url=<url> → flux-canny-pro with the URL as
+          control_image. Preserves the composition of a real news photo
+          while applying the style prompt. Used to caricaturize event
+          shots so the subjects remain recognizable.
+        - neither → plain text-to-image via flux-pro.
         """
+        if anchor_portrait_url:
+            logger.info(f"🎭 [IMG-{index+1}] using cached anchor portrait (FLUX skipped)")
+            return anchor_portrait_url
+
         use_canny = bool(reference_image_url)
         model = "black-forest-labs/flux-canny-pro" if use_canny else "black-forest-labs/flux-pro"
 
-        for attempt in range(self.config.max_retries):
+        rl_retries = 0  # rate-limit retries don't count against real failures
+        attempt = 0
+        while attempt < self.config.max_retries:
             try:
                 await self.rate_limiter.acquire()
                 mode = "CANNY+ref" if use_canny else "TXT"
@@ -136,13 +162,20 @@ class ReplicateOrchestrator:
                 logger.info(f"✅ [IMG-{index+1}] URL: {url[:80]}")
                 return url
 
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as _e:
                 logger.warning(f"⏱  [IMG-{index+1}] Timeout (try {attempt+1})")
-                if attempt < self.config.max_retries - 1:
+                attempt += 1
+                if attempt < self.config.max_retries:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
             except Exception as e:
+                if _is_rate_limit_error(e):
+                    rl_retries += 1
+                    if rl_retries > 10:
+                        raise
+                    await _backoff_for_rate_limit(f"IMG-{index+1}", rl_retries)
+                    continue   # don't advance attempt — rate limits are transient
                 logger.error(f"❌ [IMG-{index+1}] {e}")
                 # Canny-specific failures (e.g. unreadable control_image) →
                 # retry once without canny so the pipeline doesn't stall.
@@ -150,7 +183,8 @@ class ReplicateOrchestrator:
                     logger.warning(f"⚠️  [IMG-{index+1}] canny failing, falling back to text-only")
                     use_canny = False
                     model = "black-forest-labs/flux-pro"
-                if attempt < self.config.max_retries - 1:
+                attempt += 1
+                if attempt < self.config.max_retries:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
@@ -181,18 +215,31 @@ class ReplicateOrchestrator:
         self,
         prompts: List[str],
         reference_image_urls: Optional[List[Optional[str]]] = None,
+        anchor_portrait_urls: Optional[List[Optional[str]]] = None,
     ) -> Dict[str, str]:
         """Parallel FLUX gen returning URLs only. Used as input to Seedance.
 
-        reference_image_urls[i] is an optional URL to pass to flux-canny-pro
-        for scene i+1 (preserves edges of source image, applies style from
-        prompt). None → text-only flux-pro for that scene.
+        Per-scene options (i is the scene index):
+          anchor_portrait_urls[i]   → use the cached anchor portrait URL
+                                       directly. FLUX is skipped for that
+                                       scene (saves $0.055 + ensures the
+                                       anchor looks the same every time).
+          reference_image_urls[i]   → flux-canny-pro with the URL as
+                                       control_image (preserves composition
+                                       of a real news photo).
+          neither                   → plain text-to-image flux-pro.
         """
         logger.info(f"📷 Image URL batch: {len(prompts)} prompts")
         if reference_image_urls is None:
             reference_image_urls = [None] * len(prompts)
+        if anchor_portrait_urls is None:
+            anchor_portrait_urls = [None] * len(prompts)
         tasks = [
-            self._generate_image_url(p, i, reference_image_urls[i] if i < len(reference_image_urls) else None)
+            self._generate_image_url(
+                p, i,
+                reference_image_url=reference_image_urls[i] if i < len(reference_image_urls) else None,
+                anchor_portrait_url=anchor_portrait_urls[i] if i < len(anchor_portrait_urls) else None,
+            )
             for i, p in enumerate(prompts)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -209,7 +256,9 @@ class ReplicateOrchestrator:
 
     async def _animate_single(self, image_url: str, motion_prompt: str, index: int) -> str:
         """Seedance image-to-video. Returns local mp4 path."""
-        for attempt in range(self.config.max_retries):
+        rl_retries = 0
+        attempt = 0
+        while attempt < self.config.max_retries:
             try:
                 await self.rate_limiter.acquire()
                 logger.info(
@@ -248,13 +297,21 @@ class ReplicateOrchestrator:
 
             except asyncio.TimeoutError:
                 logger.warning(f"⏱  [VID-{index+1}] Timeout (try {attempt+1})")
-                if attempt < self.config.max_retries - 1:
+                attempt += 1
+                if attempt < self.config.max_retries:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
             except Exception as e:
+                if _is_rate_limit_error(e):
+                    rl_retries += 1
+                    if rl_retries > 10:
+                        raise
+                    await _backoff_for_rate_limit(f"VID-{index+1}", rl_retries)
+                    continue
                 logger.error(f"❌ [VID-{index+1}] {e}")
-                if attempt < self.config.max_retries - 1:
+                attempt += 1
+                if attempt < self.config.max_retries:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
@@ -324,7 +381,9 @@ class ReplicateOrchestrator:
             logger.warning(f"emotion {emotion!r} not in MiniMax enum, falling back to 'auto'")
             emotion = "auto"
 
-        for attempt in range(self.config.max_retries):
+        rl_retries = 0
+        attempt = 0
+        while attempt < self.config.max_retries:
             try:
                 await self.rate_limiter.acquire()
                 logger.info(
@@ -358,8 +417,15 @@ class ReplicateOrchestrator:
                 return str(local)
 
             except Exception as e:
+                if _is_rate_limit_error(e):
+                    rl_retries += 1
+                    if rl_retries > 10:
+                        raise
+                    await _backoff_for_rate_limit(f"AUD-{index+1}", rl_retries)
+                    continue
                 logger.error(f"❌ [AUD-{index+1}] {e}")
-                if attempt < self.config.max_retries - 1:
+                attempt += 1
+                if attempt < self.config.max_retries:
                     await asyncio.sleep(min(2 ** attempt, 60))
                 else:
                     raise
@@ -419,6 +485,7 @@ class ReplicateOrchestrator:
         audio_scripts = [v.get("audio_script", "") for _, v in scene_entries]
         emotions = [v.get("emotion", "auto") for _, v in scene_entries]
         reference_image_urls = [v.get("reference_image_url") for _, v in scene_entries]
+        anchor_portrait_urls = [v.get("anchor_portrait_url") for _, v in scene_entries]
         voice_params = prompts.get("voice_params", {}) if isinstance(prompts.get("voice_params"), dict) else {}
 
         if not image_prompts or not audio_scripts:
@@ -430,8 +497,10 @@ class ReplicateOrchestrator:
         )
 
         if self.config.enable_video:
-            # FLUX URLs (text-only or img2img with ref) → Seedance → local mp4
-            image_urls = await self.generate_image_url_batch(image_prompts, reference_image_urls)
+            # FLUX URLs (text-only, canny, or cached anchor portrait) → Seedance → local mp4
+            image_urls = await self.generate_image_url_batch(
+                image_prompts, reference_image_urls, anchor_portrait_urls
+            )
             videos = await self.generate_video_batch(image_urls, motion_prompts)
             images: Dict[str, str] = {}  # not needed; compositor uses videos
         else:

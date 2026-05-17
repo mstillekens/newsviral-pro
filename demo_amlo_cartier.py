@@ -32,6 +32,32 @@ from video_compositor import BrandingConfig, VideoCompositor
 from run_logger import RunLogger
 from brand_style import STYLE_VARIANTS, anchor_for, ANCHORS
 
+import json as _json
+
+
+def _inject_portrait_from_manifest(prompts: dict, anchor_id: str) -> None:
+    """Attach the cached anchor portrait URL to scenes 1 and 3. Same
+    convention as news_viral_pro._inject_anchor_portraits — duplicated here
+    so the standalone demo doesn't import the main orchestrator."""
+    manifest_path = Path("anchor_portraits/manifest.json")
+    if not manifest_path.exists():
+        logger.warning("⚠️  No hay manifest.json — corre 'python setup_anchors.py' primero")
+        return
+    try:
+        manifest = _json.loads(manifest_path.read_text())
+    except Exception:
+        logger.warning("⚠️  manifest.json corrupto, ignorando")
+        return
+    entry = manifest.get(anchor_id)
+    if not entry or not entry.get("url"):
+        logger.warning(f"⚠️  No hay portrait cacheado para {anchor_id}")
+        return
+    url = entry["url"]
+    for key in ("escena_1", "escena_3"):
+        if key in prompts and isinstance(prompts[key], dict):
+            prompts[key]["anchor_portrait_url"] = url
+    logger.info(f"🎭 Portrait inyectado: {anchor_id} (escenas 1 y 3)")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,6 +157,11 @@ async def main() -> int:
 
     # 3. Replicate (with optional cloned voice from .env).
     prompts = dict(script.scenes)
+
+    # Inject cached anchor portrait into scenes 1 and 3 so the character
+    # stays visually consistent across runs (and we skip 2 FLUX calls).
+    _inject_portrait_from_manifest(prompts, anchor.id)
+
     vid = os.environ.get("MINIMAX_VOICE_ID", "")
     if vid:
         prompts["voice_params"] = {"voice_id": vid, "language_boost": "Spanish"}
