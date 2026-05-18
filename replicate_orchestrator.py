@@ -110,6 +110,24 @@ class ReplicateOrchestrator:
 
     # ----- IMAGES (FLUX) -----
 
+    async def _url_alive(self, url: str, timeout: float = 5.0) -> bool:
+        """HEAD-check a URL. True if it returns 2xx/3xx, False on 404/timeout/error.
+
+        Used as preflight before sending replicate.delivery (ephemeral) or
+        publisher image URLs to expensive downstream calls. Saves ~3 wasted
+        retries × ~$0.05 each when an upstream URL is dead.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.head(
+                    url, allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as resp:
+                    return resp.status < 400
+        except Exception as e:
+            logger.debug(f"_url_alive {url[:60]} → {e}")
+            return False
+
     async def _generate_image_url(
         self,
         prompt: str,
@@ -130,10 +148,31 @@ class ReplicateOrchestrator:
         - neither → plain text-to-image via flux-pro.
         """
         if anchor_portrait_url:
-            logger.info(f"🎭 [IMG-{index+1}] using cached anchor portrait (FLUX skipped)")
-            return anchor_portrait_url
+            # Preflight: replicate.delivery URLs expire (24-72h). If the
+            # cached portrait is stale, the Seedance step will 404 and we'll
+            # have wasted credits + queue time. HEAD check it now so we fall
+            # back to fresh FLUX gen instead.
+            if not await self._url_alive(anchor_portrait_url):
+                logger.warning(
+                    f"⚠️  [IMG-{index+1}] cached portrait URL expired (404) — "
+                    f"falling back to FLUX. Re-run setup_anchors.py to refresh manifest.json."
+                )
+                anchor_portrait_url = None
+            else:
+                logger.info(f"🎭 [IMG-{index+1}] using cached anchor portrait (FLUX skipped)")
+                return anchor_portrait_url
 
         use_canny = bool(reference_image_url)
+        # Same preflight for canny reference — news outlets routinely delete
+        # article images, leaving 404 URLs that waste 3 retries before
+        # falling back to text-only.
+        if use_canny and not await self._url_alive(reference_image_url):
+            logger.warning(
+                f"⚠️  [IMG-{index+1}] reference_image_url 404 — falling back to text-only FLUX"
+            )
+            reference_image_url = None
+            use_canny = False
+
         model = "black-forest-labs/flux-canny-pro" if use_canny else "black-forest-labs/flux-pro"
 
         rl_retries = 0  # rate-limit retries don't count against real failures

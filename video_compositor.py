@@ -418,11 +418,13 @@ class VideoCompositor:
         #    flat TikTok-style cover (no iris animation, no anchor signature
         #    lines) — the brand requirement for vertical scroll-stopping
         #    content. Other modes keep the looney-tunes iris cards.
-        narrative_mode = getattr(self.branding, "narrative_mode", "anchor_camera")
+        # NOTE: __init__ stores BrandingConfig as `self.config`, not
+        # `self.branding`. M6 regression fix.
+        narrative_mode = getattr(self.config, "narrative_mode", "anchor_camera")
         if narrative_mode == "voiceover_only":
             intro_cmd = build_tiktok_cover_cmd(
                 self.style, intro_path, self.news_title,
-                kicker=getattr(self.branding, "cover_kicker", ""),
+                kicker=getattr(self.config, "cover_kicker", ""),
                 duration_s=self.style.intro_seconds,
             )
             # Same TikTok-style card for outro, no anchor signature line.
